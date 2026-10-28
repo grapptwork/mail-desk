@@ -588,29 +588,27 @@ function composeUrl(to, subject, body) {
   return null;
 }
 
-// 아이폰 Gmail 앱은 특정 메일을 바로 여는 공식 링크가 없다. (예전 googlegmail:///cv= 방식은 지금 안 된다는 보고가 있음)
+// 받은 날 앞뒤 하루로 좁힌 검색어. 시간대 차이로 빠지지 않게 하루씩 여유를 둔다.
+function gmailQuery(m) {
+  const parts = [];
+  if (m.from?.email) parts.push(`from:${m.from.email}`);
+  const t = Date.parse(m.received_at);
+  if (!Number.isNaN(t)) {
+    const day = (ms) => new Date(ms + 9 * 3600e3).toISOString().slice(0, 10).replace(/-/g, '/');
+    parts.push(`after:${day(t - 864e5)}`, `before:${day(t + 2 * 864e5)}`);
+  }
+  return parts.length ? parts.join(' ') : m.subject || '';
+}
+
+// 아이폰 Gmail 앱은 특정 메일을 바로 여는 공식 링크가 없다. googlegmail:///cv= 방식은 2026-10-28 정원 폰에서 시험해 보니 받은편지함만 열림.
 // 그래서 검색어(from:보낸사람)를 복사해 두고 앱을 연다. 앱 검색창에 붙여넣으면 그 사람 메일만 나온다.
 // 안드로이드는 mail.google.com 링크를 Gmail 앱이 받아서 일반 링크 그대로 둔다.
 function openInGmailApp(m) {
-  const q = m.from?.email ? `from:${m.from.email}` : m.subject || '';
+  const q = gmailQuery(m);
   // 탭한 순간 안에 복사와 앱 열기를 같이 해야 사파리가 막지 않는다.
   navigator.clipboard?.writeText(q).catch(() => {});
   toast(`검색어 복사됨 · Gmail 검색창에 붙여넣으세요 (${q})`);
   location.href = 'googlegmail://';
-}
-
-// [임시 · 2026-10-28] 아이폰에서 메일 하나를 바로 여는 방법 시험. 되는 걸 찾으면 「Gmail에서 열기」에 넣고 이 줄은 지운다.
-// 1~3: 비공식 Gmail 앱 링크(googlegmail:///cv=스레드ID/accountId=앱 계정 순번). 4: 크롬 앱으로 Gmail 웹 열기.
-function openTestRow(m) {
-  const tid = m.thread_id || m.id;
-  const a = (label, href) => h('a', { class: 'btn small', href }, label);
-  return h('div', { class: 'note opentest' },
-    h('div', null, '메일 바로 열기 시험 — 하나씩 눌러보고 어느 게 이 메일로 가는지 알려주세요'),
-    h('div', { class: 'row' },
-      a('1', `googlegmail:///cv=${tid}/accountId=0`),
-      a('2', `googlegmail:///cv=${tid}/accountId=1`),
-      a('3', `googlegmail:///cv=${tid}/accountId=2`),
-      a('4 크롬', gmailUrl(m).replace(/^https:/, 'googlechromes:'))));
 }
 
 function replySubject(m, dr) {
@@ -783,8 +781,6 @@ function buildDetail(id) {
       m.company?.name ? ` · ${m.company.name}` : '',
       m.company?.type ? ` (${COMPANY_TYPE[m.company.type] || m.company.type})` : ''),
   ));
-
-  if (IS_IOS) d.append(openTestRow(m));
 
   if (m.deadline) {
     d.append(h('div', { class: 'alert' }, `회신 기한 ${m.deadline.date}`,
