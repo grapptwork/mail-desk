@@ -9,9 +9,10 @@ const GMAIL_ACCOUNT = 'contact@grappt.co.kr';
 const TRANSLATE_WAIT_MS = 5 * 60e3;
 const RESEARCH_WAIT_MS = 15 * 60e3;
 const REGEN_WAIT_MS = 6 * 60e3;
-const MEMO_PATH = 'db/memo.json';
+const PROFILE_PATH = 'db/profile.json';
 const TOKEN_KEY = 'maildesk.token';
 const FILTER_KEY = 'maildesk.filter';
+const PROFILE_OPEN_KEY = 'maildesk.profileOpen';
 
 const VERDICT = { green: '🟢', yellow: '🟡', red: '🔴' };
 const VERDICT_NAME = { green: '🟢 초록', yellow: '🟡 노랑', red: '🔴 빨강' };
@@ -31,7 +32,7 @@ const state = {
   dirty: new Set(),
   db: null,       // Promise<{services, companies}>
   filter: lsGet(FILTER_KEY) || 'todo',
-  memo: { saved: '', sha: null, updatedAt: null, loaded: false, saving: false, error: null, el: null },
+  profile: { data: null, sha: null, loaded: false, saving: false, error: null, el: null },
 };
 
 // ---------- 작은 도구 ----------
@@ -199,7 +200,7 @@ function loadDb() {
 async function boot() {
   state.token = lsGet(TOKEN_KEY);
   if (!state.token) return renderSetup();
-  loadMemo();
+  loadProfile();
   try {
     await loadDates();
   } catch (e) {
@@ -312,103 +313,180 @@ function resetToken() {
 
 function render() {
   const app = document.getElementById('app');
-  app.replaceChildren(topBar(), memoBox(), summary(), cardList());
-  requestAnimationFrame(() => autosize(state.memo.ta));
+  app.replaceChildren(topBar(), profileBox(), summary(), cardList());
+  requestAnimationFrame(() => autosize(state.profile.inputs.memo));
 }
 
-// ---------- 메모 ----------
-// 정원이 적어 두는 현재 상황·판단 기준. 매일 아침 라우틴과 「초안 다시 쓰기」 작업이 읽는다.
+// ---------- 채널 현황 ----------
+// 정원이 적어 두는 최신 정보. 매일 아침 라우틴과 「초안 다시 쓰기」 작업이 읽는다.
+// 모든 칸은 선택이다. 비워 두면 CLAUDE.md의 기준값·기존 규칙대로 쓴다.
 
-async function loadMemo() {
-  const memo = state.memo;
+const STALE_DAYS = 30;
+const METRICS = [
+  ['followers', '팔로워', '예: 11.1만'],
+  ['views', '조회수', '예: 통상 10,000~100,000회'],
+  ['comments', '댓글', '예: 게시글당 1,000~2,000개'],
+];
+
+const today = () => nowKst().slice(0, 10);
+const daysSince = (date) => Math.floor((Date.parse(today()) - Date.parse(date)) / 864e5);
+
+async function loadProfile() {
+  const pf = state.profile;
   try {
-    const r = await readJson(MEMO_PATH);
-    memo.sha = r.sha;
-    memo.saved = r.data.text || '';
-    memo.updatedAt = r.data.updated_at || null;
-    memo.error = null;
+    const r = await readJson(PROFILE_PATH);
+    pf.sha = r.sha;
+    pf.data = r.data;
+    pf.error = null;
   } catch (e) {
-    if (e.status !== 404) memo.error = `메모를 못 불러왔어요: ${errMsg(e)}`;
+    if (e.status !== 404) pf.error = `채널 현황을 못 불러왔어요: ${errMsg(e)}`;
   }
-  memo.loaded = true;
-  if (memo.el) fillMemo();
+  pf.loaded = true;
+  if (pf.el) fillProfile();
+  refreshStale();
 }
 
-// 메모 칸은 한 번만 만들어 재사용한다. 날짜를 바꿔도 쓰던 메모가 사라지지 않게.
-function memoBox() {
-  const memo = state.memo;
-  if (memo.el) return memo.el;
-  memo.ta = h('textarea', {
+// 카드는 한 번만 만들어 재사용한다. 날짜를 바꿔도 쓰던 값이 사라지지 않게.
+function profileBox() {
+  const pf = state.profile;
+  if (pf.el) return pf.el;
+  const onInput = () => syncProfile();
+  const f = pf.inputs = {};
+  const hints = pf.hints = {};
+  const rows = [];
+  for (const [key, label, ph] of METRICS) {
+    f[key] = h('input', { type: 'text', class: 'input', placeholder: ph, disabled: true });
+    hints[key] = h('span', { class: 'hint' });
+    rows.push([label, f[key], hints[key]]);
+  }
+  f.available_from = h('input', { type: 'date', class: 'input', disabled: true });
+  hints.available_from = h('span', { class: 'hint' });
+  rows.push(['광고 가능 시작일', f.available_from, hints.available_from]);
+  f.schedule_note = h('input', { type: 'text', class: 'input', placeholder: '예: 12/1~12/10 불가', disabled: true });
+  rows.push(['일정 메모', f.schedule_note, null]);
+  f.memo = h('textarea', {
     class: 'memo-input',
     rows: '2',
     disabled: true,
-    placeholder: '예: 11/18 이후 광고 일정만 가능. 아주 유명한 브랜드면 그래도 긍정적으로 검토',
+    placeholder: '예: 아주 유명한 브랜드면 일정이 빠듯해도 긍정적으로 검토',
   });
-  memo.ta.addEventListener('input', () => { autosize(memo.ta); syncMemo(); });
-  memo.btn = h('button', { type: 'button', class: 'btn small primary', onclick: saveMemo });
-  memo.info = h('span', { class: 'muted' });
-  memo.el = h('section', { class: 'memo' },
-    h('div', { class: 'memo-head' },
-      h('b', null, '메모'),
-      h('span', { class: 'muted' }, '매일 아침 판정·초안과 「초안 다시 쓰기」에 반영돼요')),
-    memo.ta,
-    h('div', { class: 'row' }, memo.btn, memo.info));
-  if (memo.loaded) fillMemo();
-  else syncMemo();
-  return memo.el;
+  f.memo.addEventListener('input', () => autosize(f.memo));
+  rows.push(['메모', f.memo, null]);
+  for (const el of Object.values(f)) el.addEventListener('input', onInput);
+
+  pf.btn = h('button', { type: 'button', class: 'btn small primary', onclick: saveProfile });
+  pf.info = h('span', { class: 'muted' });
+  pf.summary = h('span', { class: 'muted' });
+  const det = h('details', { class: 'profile-det', open: lsGet(PROFILE_OPEN_KEY) !== '0' },
+    h('summary', null, h('b', null, '채널 현황'), ' ', pf.summary),
+    h('p', { class: 'muted small' }, '전부 선택이에요. 비워 두면 기존 기준대로 답해요. 매일 아침 판정·초안과 「초안 다시 쓰기」에 반영돼요.'),
+    h('div', { class: 'pf-grid' }, rows.map(([label, input, hint]) =>
+      h('label', { class: 'pf-row' }, h('span', { class: 'pf-label' }, label), input, hint))),
+    h('div', { class: 'row' }, pf.btn, pf.info));
+  det.addEventListener('toggle', () => {
+    lsSet(PROFILE_OPEN_KEY, det.open ? '1' : '0');
+    if (det.open) autosize(f.memo);
+  });
+  pf.el = h('section', { class: 'memo' }, det);
+  if (pf.loaded) fillProfile();
+  else syncProfile();
+  return pf.el;
 }
 
-function fillMemo() {
-  const memo = state.memo;
-  memo.ta.disabled = false;
-  if (!memoDirty()) memo.ta.value = memo.saved;
-  autosize(memo.ta);
-  syncMemo();
+const pfVal = (d, key) => (METRICS.some(([k]) => k === key) ? d?.[key]?.value : d?.[key]) || '';
+
+function fillProfile() {
+  const pf = state.profile;
+  const dirty = profileDirty();
+  for (const [key, el] of Object.entries(pf.inputs)) {
+    el.disabled = false;
+    if (!dirty) el.value = pfVal(pf.data, key);
+  }
+  autosize(pf.inputs.memo);
+  syncProfile();
 }
 
-const memoDirty = () => !!state.memo.ta && !state.memo.ta.disabled && state.memo.ta.value !== state.memo.saved;
-
-function syncMemo() {
-  const memo = state.memo;
-  const dirty = memoDirty();
-  memo.btn.disabled = memo.saving || !dirty;
-  memo.btn.textContent = memo.saving ? '저장 중…' : dirty ? '저장' : '저장됨';
-  memo.info.className = memo.error ? 'err' : 'muted';
-  memo.info.textContent = !memo.loaded ? '불러오는 중…'
-    : memo.error || (memo.updatedAt ? `${fmtTime(memo.updatedAt)} 저장` : '');
+function profileDirty() {
+  const pf = state.profile;
+  if (!pf.inputs || pf.inputs.memo.disabled) return false;
+  return Object.entries(pf.inputs).some(([key, el]) => el.value.trim() !== pfVal(pf.data, key).trim());
 }
 
-async function saveMemo() {
-  const memo = state.memo;
-  if (memo.saving || !memoDirty()) return;
-  const data = { schema: 1, text: memo.ta.value.trimEnd(), updated_at: nowKst() };
-  memo.saving = true;
-  syncMemo();
+function syncProfile() {
+  const pf = state.profile;
+  const dirty = profileDirty();
+  const d = pf.data || {};
+  pf.btn.disabled = pf.saving || !dirty;
+  pf.btn.textContent = pf.saving ? '저장 중…' : dirty ? '저장' : '저장됨';
+  pf.info.className = pf.error ? 'err' : 'muted';
+  pf.info.textContent = !pf.loaded ? '불러오는 중…'
+    : pf.error || (d.updated_at ? `${fmtTime(d.updated_at)} 저장` : '');
+
+  for (const [key] of METRICS) {
+    const m = d[key];
+    const old = m?.value && m.checked ? daysSince(m.checked) : null;
+    pf.hints[key].textContent = old == null ? '' : `${m.checked.slice(5).replace('-', '/')} 확인${old > STALE_DAYS ? ` · ⚠ ${old}일 지남 (기존 규칙대로 다시 확인)` : ''}`;
+    pf.hints[key].classList.toggle('warn-text', old > STALE_DAYS);
+  }
+  const from = pf.inputs.available_from.value;
+  pf.hints.available_from.textContent = from && from < today() ? '지난 날짜라 무시돼요' : '';
+
+  // 접었을 때 보이는 한 줄 요약
+  const parts = [
+    pfVal(d, 'followers') && `팔로워 ${pfVal(d, 'followers')}`,
+    d.available_from && d.available_from >= today() && `${d.available_from.slice(5).replace('-', '/')}부터 광고 가능`,
+    d.schedule_note && '일정 메모',
+    d.memo && '메모',
+  ].filter(Boolean);
+  pf.summary.textContent = parts.length ? `· ${parts.join(' · ')}` : '· 비어 있음 (기존 기준대로)';
+}
+
+async function saveProfile() {
+  const pf = state.profile;
+  if (pf.saving || !profileDirty()) return;
+  const f = pf.inputs;
+  const old = pf.data || {};
+  const data = { schema: 1 };
+  for (const [key] of METRICS) {
+    const value = f[key].value.trim();
+    // 확인일은 값을 바꿨을 때만 오늘로. 지우면 null.
+    data[key] = { value, checked: !value ? null : value === pfVal(old, key).trim() ? old[key]?.checked || today() : today() };
+  }
+  data.available_from = f.available_from.value || null;
+  data.schedule_note = f.schedule_note.value.trim();
+  data.memo = f.memo.value.trim();
+  data.updated_at = nowKst();
+  pf.saving = true;
+  syncProfile();
   try {
     for (let attempt = 0; ; attempt++) {
       try {
-        memo.sha = await writeJson(MEMO_PATH, data, memo.sha || undefined, 'site: 메모 수정');
+        pf.sha = await writeJson(PROFILE_PATH, data, pf.sha || undefined, 'site: 채널 현황 수정');
         break;
       } catch (e) {
-        // 메모는 사이트에서만 고친다. 다른 기기에서 먼저 저장해 sha가 어긋났으면 지금 쓴 내용으로 덮는다.
+        // 사이트에서만 고치는 파일이다. 다른 기기에서 먼저 저장해 sha가 어긋났으면 지금 쓴 내용으로 덮는다.
         if ((e.status === 409 || e.status === 422) && attempt === 0) {
-          memo.sha = (await readJson(MEMO_PATH).catch(() => null))?.sha;
+          pf.sha = (await readJson(PROFILE_PATH).catch(() => null))?.sha;
           continue;
         }
         throw e;
       }
     }
-    memo.saved = data.text;
-    memo.updatedAt = data.updated_at;
-    memo.error = null;
-    if (memo.ta.value.trimEnd() === data.text) memo.ta.value = data.text;
-    toast('메모를 저장했어요');
+    pf.data = data;
+    pf.error = null;
+    toast('채널 현황을 저장했어요');
+    refreshStale();
   } catch (e) {
-    toast(`메모 저장 실패: ${errMsg(e)}`, true);
+    toast(`채널 현황 저장 실패: ${errMsg(e)}`, true);
   } finally {
-    memo.saving = false;
-    syncMemo();
+    pf.saving = false;
+    syncProfile();
   }
+}
+
+// 열려 있는 초안들의 "현황 바뀜" 표시를 다시 맞춘다.
+function refreshStale() {
+  for (const id of Object.keys(state.mails)) renderRegen(id);
 }
 
 function topBar() {
@@ -878,6 +956,7 @@ function draftsView(id) {
 function regenBox(id) {
   const entry = state.mails[id];
   entry.rg = {
+    stale: h('p', { class: 'tr-status err', hidden: true }),
     label: h('p', { class: 'label' }),
     input: h('textarea', {
       class: 'note-input',
@@ -893,8 +972,8 @@ function regenBox(id) {
     }, '↶ 이전 초안으로'),
     status: h('p', { class: 'tr-status', hidden: true }),
   };
-  const { label, input, btn, undo, status } = entry.rg;
-  return h('div', { class: 'regen' }, label, input, h('div', { class: 'row' }, btn, undo), status);
+  const { stale, label, input, btn, undo, status } = entry.rg;
+  return h('div', { class: 'regen' }, stale, label, input, h('div', { class: 'row' }, btn, undo), status);
 }
 
 const tabKind = (entry) => entry.data.drafts?.[entry.tab]?.kind;
@@ -902,9 +981,14 @@ const tabKind = (entry) => entry.data.drafts?.[entry.tab]?.kind;
 function renderRegen(id) {
   const entry = state.mails[id];
   if (!entry.rg) return;
-  const { label, btn, undo, status } = entry.rg;
+  const { stale, label, btn, undo, status } = entry.rg;
   const kind = tabKind(entry);
   const same = (entry.data.drafts || []).filter((x) => x.kind === kind);
+  // 채널 현황을 이 초안을 만든 뒤에 바꿨으면 알려만 준다. (자동으로 다시 쓰지 않는다)
+  const changed = state.profile.data?.updated_at;
+  const made = same.map((x) => x.regenerated_at || entry.data.processed_at || '').sort().pop();
+  stale.hidden = !(changed && made && changed > made);
+  stale.textContent = stale.hidden ? '' : `채널 현황이 이 초안 뒤에 바뀌었어요 (${fmtTime(changed)}). 보낼 거면 「초안 다시 쓰기」로 맞춰 주세요`;
   label.textContent = `수정 요청 · ${KIND[kind] || kind} 초안${same.length > 1 ? ' (KO·EN 같이 다시 써요)' : ''}`;
   btn.disabled = !!(entry.regenerating || entry.saving);
   btn.textContent = entry.regenerating ? '다시 쓰는 중…' : '초안 다시 쓰기';
@@ -1405,7 +1489,7 @@ async function save(id, { quiet = false } = {}) {
 }
 
 window.addEventListener('beforeunload', (e) => {
-  if (state.dirty.size || memoDirty()) {
+  if (state.dirty.size || profileDirty()) {
     e.preventDefault();
     e.returnValue = '';
   }
