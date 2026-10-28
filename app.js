@@ -588,6 +588,17 @@ function composeUrl(to, subject, body) {
   return null;
 }
 
+// 아이폰 Gmail 앱은 특정 메일을 바로 여는 공식 링크가 없다. (예전 googlegmail:///cv= 방식은 지금 안 된다는 보고가 있음)
+// 그래서 검색어(from:보낸사람)를 복사해 두고 앱을 연다. 앱 검색창에 붙여넣으면 그 사람 메일만 나온다.
+// 안드로이드는 mail.google.com 링크를 Gmail 앱이 받아서 일반 링크 그대로 둔다.
+function openInGmailApp(m) {
+  const q = m.from?.email ? `from:${m.from.email}` : m.subject || '';
+  // 탭한 순간 안에 복사와 앱 열기를 같이 해야 사파리가 막지 않는다.
+  navigator.clipboard?.writeText(q).catch(() => {});
+  toast(`검색어 복사됨 · Gmail 검색창에 붙여넣으세요 (${q})`);
+  location.href = 'googlegmail://';
+}
+
 function replySubject(m, dr) {
   if (dr?.subject) return dr.subject;
   if (!m.subject) return '';
@@ -750,7 +761,9 @@ function buildDetail(id) {
 
   d.append(h('div', { class: 'meta' },
     h('div', null, h('b', null, m.from?.name || ''), ' ', h('span', { class: 'muted' }, m.from?.email || ''),
-      IS_MOBILE ? null : [' · ', link(gmailUrl(m), 'Gmail에서 열기')]),
+      ' · ', IS_IOS
+        ? h('button', { type: 'button', class: 'linkish', onclick: () => openInGmailApp(m) }, 'Gmail에서 열기')
+        : link(gmailUrl(m), 'Gmail에서 열기')),
     h('div', null, m.subject || ''),
     h('div', { class: 'muted' }, `받음 ${fmtTime(m.received_at)}`,
       m.company?.name ? ` · ${m.company.name}` : '',
