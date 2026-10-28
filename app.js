@@ -8,6 +8,8 @@ const API = 'https://api.github.com';
 const GMAIL_ACCOUNT = 'contact@grappt.co.kr';
 const TRANSLATE_WAIT_MS = 5 * 60e3;
 const RESEARCH_WAIT_MS = 15 * 60e3;
+const REGEN_WAIT_MS = 6 * 60e3;
+const MEMO_PATH = 'db/memo.json';
 const TOKEN_KEY = 'maildesk.token';
 const FILTER_KEY = 'maildesk.filter';
 
@@ -29,6 +31,7 @@ const state = {
   dirty: new Set(),
   db: null,       // Promise<{services, companies}>
   filter: lsGet(FILTER_KEY) || 'todo',
+  memo: { saved: '', sha: null, updatedAt: null, loaded: false, saving: false, error: null, el: null },
 };
 
 // ---------- 작은 도구 ----------
@@ -196,6 +199,7 @@ function loadDb() {
 async function boot() {
   state.token = lsGet(TOKEN_KEY);
   if (!state.token) return renderSetup();
+  loadMemo();
   try {
     await loadDates();
   } catch (e) {
@@ -308,7 +312,103 @@ function resetToken() {
 
 function render() {
   const app = document.getElementById('app');
-  app.replaceChildren(topBar(), summary(), cardList());
+  app.replaceChildren(topBar(), memoBox(), summary(), cardList());
+  requestAnimationFrame(() => autosize(state.memo.ta));
+}
+
+// ---------- 메모 ----------
+// 정원이 적어 두는 현재 상황·판단 기준. 매일 아침 라우틴과 「초안 다시 쓰기」 작업이 읽는다.
+
+async function loadMemo() {
+  const memo = state.memo;
+  try {
+    const r = await readJson(MEMO_PATH);
+    memo.sha = r.sha;
+    memo.saved = r.data.text || '';
+    memo.updatedAt = r.data.updated_at || null;
+    memo.error = null;
+  } catch (e) {
+    if (e.status !== 404) memo.error = `메모를 못 불러왔어요: ${errMsg(e)}`;
+  }
+  memo.loaded = true;
+  if (memo.el) fillMemo();
+}
+
+// 메모 칸은 한 번만 만들어 재사용한다. 날짜를 바꿔도 쓰던 메모가 사라지지 않게.
+function memoBox() {
+  const memo = state.memo;
+  if (memo.el) return memo.el;
+  memo.ta = h('textarea', {
+    class: 'memo-input',
+    rows: '2',
+    disabled: true,
+    placeholder: '예: 11/18 이후 광고 일정만 가능. 아주 유명한 브랜드면 그래도 긍정적으로 검토',
+  });
+  memo.ta.addEventListener('input', () => { autosize(memo.ta); syncMemo(); });
+  memo.btn = h('button', { type: 'button', class: 'btn small primary', onclick: saveMemo });
+  memo.info = h('span', { class: 'muted' });
+  memo.el = h('section', { class: 'memo' },
+    h('div', { class: 'memo-head' },
+      h('b', null, '메모'),
+      h('span', { class: 'muted' }, '매일 아침 판정·초안과 「초안 다시 쓰기」에 반영돼요')),
+    memo.ta,
+    h('div', { class: 'row' }, memo.btn, memo.info));
+  if (memo.loaded) fillMemo();
+  else syncMemo();
+  return memo.el;
+}
+
+function fillMemo() {
+  const memo = state.memo;
+  memo.ta.disabled = false;
+  if (!memoDirty()) memo.ta.value = memo.saved;
+  autosize(memo.ta);
+  syncMemo();
+}
+
+const memoDirty = () => !!state.memo.ta && !state.memo.ta.disabled && state.memo.ta.value !== state.memo.saved;
+
+function syncMemo() {
+  const memo = state.memo;
+  const dirty = memoDirty();
+  memo.btn.disabled = memo.saving || !dirty;
+  memo.btn.textContent = memo.saving ? '저장 중…' : dirty ? '저장' : '저장됨';
+  memo.info.className = memo.error ? 'err' : 'muted';
+  memo.info.textContent = !memo.loaded ? '불러오는 중…'
+    : memo.error || (memo.updatedAt ? `${fmtTime(memo.updatedAt)} 저장` : '');
+}
+
+async function saveMemo() {
+  const memo = state.memo;
+  if (memo.saving || !memoDirty()) return;
+  const data = { schema: 1, text: memo.ta.value.trimEnd(), updated_at: nowKst() };
+  memo.saving = true;
+  syncMemo();
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        memo.sha = await writeJson(MEMO_PATH, data, memo.sha || undefined, 'site: 메모 수정');
+        break;
+      } catch (e) {
+        // 메모는 사이트에서만 고친다. 다른 기기에서 먼저 저장해 sha가 어긋났으면 지금 쓴 내용으로 덮는다.
+        if ((e.status === 409 || e.status === 422) && attempt === 0) {
+          memo.sha = (await readJson(MEMO_PATH).catch(() => null))?.sha;
+          continue;
+        }
+        throw e;
+      }
+    }
+    memo.saved = data.text;
+    memo.updatedAt = data.updated_at;
+    memo.error = null;
+    if (memo.ta.value.trimEnd() === data.text) memo.ta.value = data.text;
+    toast('메모를 저장했어요');
+  } catch (e) {
+    toast(`메모 저장 실패: ${errMsg(e)}`, true);
+  } finally {
+    memo.saving = false;
+    syncMemo();
+  }
 }
 
 function topBar() {
@@ -460,6 +560,7 @@ function fillHead(id) {
       draftCount ? h('span', { class: 'chip' }, draftCount > 1 ? `초안 ${draftCount}종` : '초안') : null,
       (m.drafts || []).some((d) => d.edited) ? h('span', { class: 'chip' }, '수정함') : null,
       m.translate_request && !m.translate_request.error ? h('span', { class: 'chip' }, '번역 중') : null,
+      m.regenerate_request && !m.regenerate_request.error ? h('span', { class: 'chip' }, '다시 쓰는 중') : null,
       m.research_request && !m.research_request.error ? h('span', { class: 'chip' }, '조사 중') : null,
       state.dirty.has(id) ? h('span', { class: 'chip warn' }, '저장 안 됨') : null,
     ),
@@ -699,6 +800,8 @@ function draftsView(id) {
     tabEls.forEach((t, j) => t.setAttribute('aria-selected', String(i === j)));
     panelEls.forEach((p, j) => { p.hidden = i !== j; });
     panelEls[i].querySelectorAll('textarea').forEach(autosize);
+    entry.tab = i;
+    renderRegen(id);
   };
 
   entry.draftInputs = [];
@@ -762,7 +865,163 @@ function draftsView(id) {
   const first = Math.max(0, m.drafts.findIndex((dr) => dr.lang === (m.lang === 'ko' ? 'ko' : 'en')));
   tabEls.forEach((t, j) => t.setAttribute('aria-selected', String(j === first)));
   panelEls.forEach((p, j) => { p.hidden = j !== first; });
-  return h('section', { class: 'drafts' }, h('h3', null, '답장 초안'), tabs, panels);
+  entry.tab = first;
+  const regen = regenBox(id);
+  renderRegen(id);
+  if (m.regenerate_request && !m.regenerate_request.error) watchRegenerate(id);
+  return h('section', { class: 'drafts' }, h('h3', null, '답장 초안'), tabs, panels, regen);
+}
+
+// ---------- 초안 다시 쓰기 ----------
+// 보고 있는 탭의 초안 종류(kind)를 다시 쓴다. 해외 건은 KO·EN을 같이.
+
+function regenBox(id) {
+  const entry = state.mails[id];
+  entry.rg = {
+    label: h('p', { class: 'label' }),
+    input: h('textarea', {
+      class: 'note-input',
+      rows: '2',
+      placeholder: '예: 광고 일정이 꽉 차서 죄송하지만 이번엔 어렵다는 내용으로 바꿔줘',
+    }),
+    btn: h('button', { type: 'button', class: 'btn', onclick: () => startRegenerate(id) }, '초안 다시 쓰기'),
+    undo: h('button', {
+      type: 'button',
+      class: 'btn small',
+      title: '다시 쓰기 전 초안과 바꿔요. 한 번 더 누르면 다시 돌아와요',
+      onclick: () => swapPrevious(id),
+    }, '↶ 이전 초안으로'),
+    status: h('p', { class: 'tr-status', hidden: true }),
+  };
+  const { label, input, btn, undo, status } = entry.rg;
+  return h('div', { class: 'regen' }, label, input, h('div', { class: 'row' }, btn, undo), status);
+}
+
+const tabKind = (entry) => entry.data.drafts?.[entry.tab]?.kind;
+
+function renderRegen(id) {
+  const entry = state.mails[id];
+  if (!entry.rg) return;
+  const { label, btn, undo, status } = entry.rg;
+  const kind = tabKind(entry);
+  const same = (entry.data.drafts || []).filter((x) => x.kind === kind);
+  label.textContent = `수정 요청 · ${KIND[kind] || kind} 초안${same.length > 1 ? ' (KO·EN 같이 다시 써요)' : ''}`;
+  btn.disabled = !!(entry.regenerating || entry.saving);
+  btn.textContent = entry.regenerating ? '다시 쓰는 중…' : '초안 다시 쓰기';
+  undo.hidden = !same.some((x) => x.previous_body != null);
+  undo.disabled = !!(entry.regenerating || entry.saving);
+  const req = entry.data.regenerate_request;
+  let note = entry.rgNote;
+  if (!note && req?.error) note = { text: `다시 쓰기 실패: ${req.error}`, err: true };
+  else if (!note && req) note = { text: `${KIND[req.kind] || req.kind} 초안 다시 쓰는 중… 1~3분 걸려요. 창을 닫아도 계속돼요` };
+  status.hidden = !note;
+  status.textContent = note ? note.text : '';
+  status.classList.toggle('err', !!note?.err);
+}
+
+async function startRegenerate(id) {
+  const entry = state.mails[id];
+  if (entry.saving || entry.regenerating) return;
+  if (entry.watching) {
+    toast('영문 번역이 끝난 뒤에 눌러 주세요', true);
+    return;
+  }
+  const comment = entry.rg.input.value.trim();
+  if (!comment) {
+    toast('어떻게 고칠지 적어 주세요', true);
+    entry.rg.input.focus();
+    return;
+  }
+  // 고치던 초안도 같이 저장해서, 고친 본문을 바탕으로 다시 쓰게 한다.
+  entry.pending.regenerate = { kind: tabKind(entry), comment };
+  entry.rgNote = { text: '요청 저장 중…' };
+  renderRegen(id);
+  if (!(await save(id, { quiet: true }))) {
+    entry.rgNote = null;
+    renderRegen(id);
+    return;
+  }
+  try {
+    await dispatch('regenerate-draft');
+  } catch (e) {
+    entry.rgNote = { text: `다시 쓰기를 시작하지 못했어요: ${errMsg(e)} — 다시 눌러 주세요`, err: true };
+    renderRegen(id);
+    return;
+  }
+  watchRegenerate(id);
+}
+
+async function watchRegenerate(id) {
+  const entry = state.mails[id];
+  if (entry.regenerating) return;
+  entry.regenerating = true;
+  entry.rgNote = null;
+  const kind = entry.data.regenerate_request?.kind;
+  renderRegen(id);
+  fillHead(id);
+  try {
+    const r = await waitForJob(id, 'regenerate_request', REGEN_WAIT_MS);
+    if (r?.timeout) entry.rgNote = { text: '다시 쓰기가 오래 걸리고 있어요. 잠시 뒤 ⟳ 새로고침해 보세요', err: true };
+    else if (r) applyRegenerate(id, r.fresh, kind);
+  } finally {
+    entry.regenerating = false;
+    if (state.mails[id] === entry) {
+      renderRegen(id);
+      fillHead(id);
+    }
+  }
+}
+
+// kind 초안 입력칸을 entry.data의 본문으로 바꾼다. 그 사이 직접 고치던 칸은 두고 false.
+function showDrafts(id, kind) {
+  const entry = state.mails[id];
+  let all = true;
+  (entry.draftKeys || []).forEach((key, i) => {
+    const dr = entry.data.drafts?.find((x) => `${x.kind}/${x.lang}` === key);
+    const ta = entry.draftInputs?.[i];
+    if (!dr || dr.kind !== kind || !ta) return;
+    if (entry.pending.drafts[i] != null) {
+      all = false;
+      return;
+    }
+    ta.value = dr.body || '';
+    ta.dispatchEvent(new Event('refresh'));
+  });
+  return all;
+}
+
+function applyRegenerate(id, fresh, kind) {
+  const entry = state.mails[id];
+  entry.data = fresh.data;
+  entry.sha = fresh.sha;
+  if (fresh.data.regenerate_request?.error) {
+    toast('초안 다시 쓰기에 실패했어요', true);
+    return;
+  }
+  if (!showDrafts(id, kind)) {
+    entry.rgNote = { text: '초안 칸을 직접 고치던 중이라 새 초안으로 바꾸지 않았어요. ⟳ 새로고침하면 보여요', err: true };
+    return;
+  }
+  entry.rg.input.value = '';
+  const comment = fresh.data.drafts?.find((x) => x.kind === kind)?.regen_comment;
+  entry.rgNote = { text: `다시 썼어요 ✓${comment ? ` 요청: “${comment}”` : ''}` };
+  toast('초안을 다시 썼어요');
+}
+
+async function swapPrevious(id) {
+  const entry = state.mails[id];
+  if (entry.saving || entry.regenerating) return;
+  const kind = tabKind(entry);
+  const editing = (entry.draftKeys || []).some((key, i) => key.startsWith(`${kind}/`) && entry.pending.drafts[i] != null);
+  if (!confirm(editing ? '저장 안 한 수정은 사라지고 이전 초안으로 바뀌어요. 계속할까요?' : '이전 초안으로 바꿀까요?')) return;
+  (entry.draftKeys || []).forEach((key, i) => { if (key.startsWith(`${kind}/`)) delete entry.pending.drafts[i]; });
+  entry.pending.swap = kind;
+  entry.rgNote = null;
+  if (await save(id, { quiet: true })) {
+    showDrafts(id, kind);
+    toast('이전 초안으로 바꿨어요');
+  }
+  renderRegen(id);
 }
 
 // ---------- 영문 다시 번역 ----------
@@ -770,6 +1029,10 @@ function draftsView(id) {
 async function startTranslation(id, i) {
   const entry = state.mails[id];
   if (entry.saving || entry.watching) return;
+  if (entry.regenerating) {
+    toast('초안 다시 쓰기가 끝난 뒤에 눌러 주세요', true);
+    return;
+  }
   const kind = entry.data.drafts[i].kind;
   const en = entry.data.drafts.findIndex((x) => x.kind === kind && x.lang === 'en');
   if (entry.pending.drafts[en] != null && !confirm('EN 탭에서 고친 내용이 번역본으로 바뀌어요. 계속할까요?')) return;
@@ -1025,11 +1288,12 @@ function renderActions(id) {
 // ---------- 저장 ----------
 
 function emptyPending() {
-  return { drafts: {}, feedback: null, status: null, translate: null, research: false };
+  return { drafts: {}, feedback: null, status: null, translate: null, research: false, regenerate: null, swap: null };
 }
 
 function hasPending(p) {
-  return Object.keys(p.drafts).length > 0 || p.feedback != null || p.status != null || p.translate != null || p.research;
+  return Object.keys(p.drafts).length > 0 || p.feedback != null || p.status != null || p.translate != null ||
+    p.research || p.regenerate != null || p.swap != null;
 }
 
 function markDirty(id) {
@@ -1064,6 +1328,15 @@ function applyPending(fresh, base, p, now) {
   }
   if (p.translate) d.translate_request = { kind: p.translate, requested_at: now };
   if (p.research) d.research_request = { requested_at: now };
+  if (p.regenerate) d.regenerate_request = { ...p.regenerate, requested_at: now };
+  if (p.swap) {
+    for (const t of d.drafts || []) {
+      if (t.kind !== p.swap || t.previous_body == null) continue;
+      [t.body, t.previous_body] = [t.previous_body, t.body];
+      t.edited = true;
+      t.edited_at = now;
+    }
+  }
   return d;
 }
 
@@ -1074,6 +1347,8 @@ function commitMessage(id, p, data) {
   if (p.status) what.push(`상태 ${p.status}`);
   if (p.translate) what.push('영문 번역 요청');
   if (p.research) what.push('더 조사 요청');
+  if (p.regenerate) what.push('초안 다시 쓰기 요청');
+  if (p.swap) what.push('이전 초안으로');
   return `site: ${data.brand?.name || id} ${what.join(', ')}`.trim();
 }
 
@@ -1086,6 +1361,7 @@ async function save(id, { quiet = false } = {}) {
   entry.saving = true;
   let ok = false;
   renderActions(id);
+  renderRegen(id);
   syncCheck(id);
   try {
     for (let attempt = 0; ; attempt++) {
@@ -1108,9 +1384,11 @@ async function save(id, { quiet = false } = {}) {
       drafts: { ...snap.drafts, ...cur.drafts },
       feedback: cur.feedback ?? snap.feedback,
       status: cur.status ?? snap.status,
-      // 번역·조사 요청은 실패하면 다시 누르게 한다
+      // 번역·조사·다시 쓰기 요청은 실패하면 다시 누르게 한다
       translate: null,
       research: false,
+      regenerate: null,
+      swap: null,
     };
     toast(`저장 실패: ${errMsg(e)}`, true);
   } finally {
@@ -1120,13 +1398,14 @@ async function save(id, { quiet = false } = {}) {
     entry.el.className = cardClass(entry.data) + (entry.detail && !entry.detail.hidden ? ' open' : '');
     fillHead(id);
     renderActions(id);
+    renderRegen(id);
     syncCheck(id);
   }
   return ok;
 }
 
 window.addEventListener('beforeunload', (e) => {
-  if (state.dirty.size) {
+  if (state.dirty.size || memoDirty()) {
     e.preventDefault();
     e.returnValue = '';
   }
