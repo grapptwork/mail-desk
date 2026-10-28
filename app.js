@@ -5,6 +5,9 @@
 const REPO = 'grapptwork/instagram-mail-reply';
 const BRANCH = 'main';
 const API = 'https://api.github.com';
+const GMAIL_ACCOUNT = 'contact@grappt.co.kr';
+const TRANSLATE_WAIT_MS = 5 * 60e3;
+const RESEARCH_WAIT_MS = 15 * 60e3;
 const TOKEN_KEY = 'maildesk.token';
 const FILTER_KEY = 'maildesk.filter';
 
@@ -80,13 +83,20 @@ function nowKst() {
   return new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 19) + '+09:00';
 }
 
-function toast(msg, isError) {
+function toast(msg, isError, action) {
   const el = document.getElementById('toast');
-  el.textContent = msg;
+  el.replaceChildren(msg);
+  if (action) {
+    el.append(h('button', {
+      type: 'button',
+      class: 'toast-action',
+      onclick: () => { el.hidden = true; action.fn(); },
+    }, action.label));
+  }
   el.className = isError ? 'error' : '';
   el.hidden = false;
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { el.hidden = true; }, isError ? 6000 : 2200);
+  toast.timer = setTimeout(() => { el.hidden = true; }, isError ? 6000 : action ? 5000 : 2200);
 }
 
 function errMsg(e) {
@@ -141,7 +151,7 @@ async function gh(path, opts = {}) {
     try { err.detail = (await res.json()).message; } catch { /* 본문 없음 */ }
     throw err;
   }
-  return res.json();
+  return res.status === 204 ? null : res.json();
 }
 
 const contents = (path) => `/repos/${REPO}/contents/${encPath(path)}`;
@@ -164,6 +174,12 @@ async function writeJson(path, data, sha, message) {
   });
   const r = await gh(contents(path), { method: 'PUT', body });
   return r.content.sha;
+}
+
+// 비공개 repo의 .github/workflows/ 작업을 깨운다. (translate-draft → translate.yml, research-more → research.yml)
+// 처리할 메일은 워크플로가 파일의 translate_request / research_request로 찾는다.
+function dispatch(eventType) {
+  return gh(`/repos/${REPO}/dispatches`, { method: 'POST', body: JSON.stringify({ event_type: eventType }) });
 }
 
 function loadDb() {
@@ -353,12 +369,72 @@ function getCard(id) {
   if (entry.el) return entry.el;
   const m = entry.data;
   const head = h('button', { type: 'button', class: 'card-head', 'aria-expanded': 'false' });
-  const card = h('article', { class: cardClass(m), id: `m-${id}` }, head);
+  const check = h('input', { type: 'checkbox', class: 'done-check', 'aria-label': '답장 완료', title: '답장 완료' });
+  check.addEventListener('change', () => toggleDone(id, check.checked));
+  const gmail = h('a', {
+    class: 'gmail',
+    href: gmailUrl(m),
+    target: '_blank',
+    rel: 'noopener noreferrer',
+    title: 'Gmail에서 이 메일 열기',
+  }, '답장 ↗');
+  const card = h('article', { class: cardClass(m), id: `m-${id}` },
+    h('div', { class: 'card-row' }, check, head, gmail));
   head.addEventListener('click', () => toggleCard(id));
   entry.el = card;
   entry.head = head;
+  entry.check = check;
   fillHead(id);
+  syncCheck(id);
   return card;
+}
+
+function gmailUrl(m) {
+  return `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(GMAIL_ACCOUNT)}#all/${m.thread_id || m.id}`;
+}
+
+const isDone = (status) => status === 'replied' || status === 'archived';
+
+function syncCheck(id) {
+  const entry = state.mails[id];
+  if (!entry.check) return;
+  // 저장 중엔 누른 상태를 그대로 둔다. (pending은 저장 시작 때 비워짐)
+  if (!entry.saving) entry.check.checked = isDone(entry.pending.status || entry.data.status);
+  entry.check.disabled = entry.saving;
+}
+
+// 체크하면 답장함으로 바꾸고, 처리 전만 보기에서는 목록에서 뺀다. 되돌리기는 이전 상태로.
+async function toggleDone(id, done) {
+  const entry = state.mails[id];
+  const before = entry.pending.status || entry.data.status;
+  entry.pending.status = done ? 'replied' : (isDone(entry.undoStatus) ? 'new' : entry.undoStatus || 'new');
+  if (done) entry.undoStatus = before;
+  entry.el.classList.toggle('done', done);
+  const ok = await save(id, { quiet: true });
+  if (!ok) {
+    // 체크는 실패하면 그냥 원래대로. (저장 안 됨 상태로 남기지 않는다)
+    entry.pending.status = null;
+    if (!hasPending(entry.pending)) state.dirty.delete(id);
+    fillHead(id);
+    renderActions(id);
+    syncCheck(id);
+    return;
+  }
+  if (!done) {
+    toast('처리 전으로 돌렸어요');
+    return;
+  }
+  const undo = { label: '되돌리기', fn: () => toggleDone(id, false).then(() => render()) };
+  if (state.filter !== 'todo') {
+    toast('답장 완료로 표시했어요', false, undo);
+    return;
+  }
+  entry.el.classList.add('leaving');
+  setTimeout(() => {
+    entry.el.classList.remove('leaving');
+    render();
+  }, 250);
+  toast('답장 완료 · 목록에서 뺐어요', false, undo);
 }
 
 function cardClass(m) {
@@ -366,6 +442,7 @@ function cardClass(m) {
   if (m.urgent) cls.push('urgent');
   if (m.verdict) cls.push(`v-${m.verdict}`);
   if (m.category === 'collab_duplicate') cls.push('dim');
+  if (isDone(m.status)) cls.push('done');
   return cls.join(' ');
 }
 
@@ -382,6 +459,8 @@ function fillHead(id) {
       m.from_spam ? h('span', { class: 'chip warn' }, '스팸함') : null,
       draftCount ? h('span', { class: 'chip' }, draftCount > 1 ? `초안 ${draftCount}종` : '초안') : null,
       (m.drafts || []).some((d) => d.edited) ? h('span', { class: 'chip' }, '수정함') : null,
+      m.translate_request && !m.translate_request.error ? h('span', { class: 'chip' }, '번역 중') : null,
+      m.research_request && !m.research_request.error ? h('span', { class: 'chip' }, '조사 중') : null,
       state.dirty.has(id) ? h('span', { class: 'chip warn' }, '저장 안 됨') : null,
     ),
   );
@@ -437,7 +516,8 @@ function buildDetail(id) {
   const d = h('div', { class: 'detail' });
 
   d.append(h('div', { class: 'meta' },
-    h('div', null, h('b', null, m.from?.name || ''), ' ', h('span', { class: 'muted' }, m.from?.email || '')),
+    h('div', null, h('b', null, m.from?.name || ''), ' ', h('span', { class: 'muted' }, m.from?.email || ''),
+      ' · ', link(gmailUrl(m), 'Gmail에서 열기')),
     h('div', null, m.subject || ''),
     h('div', { class: 'muted' }, `받음 ${fmtTime(m.received_at)}`,
       m.company?.name ? ` · ${m.company.name}` : '',
@@ -475,39 +555,88 @@ function buildDetail(id) {
 
   d.append(section('메일 내용', h('div', { class: 'body' }, m.body || '(내용 없음)')));
 
-  const research = researchSection(m);
+  const research = researchSection(id);
   if (research) d.append(research);
+  if (m.research_request && !m.research_request.error) watchResearch(id);
   if (m.drafts?.length) d.append(draftsView(id));
   d.append(feedbackView(id));
   d.append(actionsView(id));
   return d;
 }
 
-function researchSection(m) {
+function researchSection(id) {
+  const entry = state.mails[id];
+  const m = entry.data;
+  if (!m.brand?.service_id && !m.company?.company_id) return null;
+  const views = h('div', null, h('p', { class: 'muted' }, '불러오는 중…'));
+  const btn = h('button', {
+    type: 'button',
+    class: 'btn small',
+    title: '못 찾은 항목 위주로 조금 더 찾아요 (Sonnet, 검색 10회 이내)',
+    onclick: () => startResearch(id),
+  }, '더 조사');
+  entry.rs = {
+    views,
+    btn,
+    status: h('p', { class: 'tr-status', hidden: true }),
+    note: h('div', { class: 'note', hidden: true }),
+  };
+  const det = section('조사 결과', h('div', { class: 'research' },
+    h('div', { class: 'row' }, btn, h('span', { class: 'muted' }, '판정에 필요한 항목을 조금 더 찾아요')),
+    entry.rs.status,
+    entry.rs.note,
+    views));
+  det.addEventListener('toggle', () => {
+    if (det.open && !views.dataset.done) fillResearch(id);
+  });
+  renderResearch(id);
+  return det;
+}
+
+async function fillResearch(id) {
+  const m = state.mails[id].data;
+  const { views } = state.mails[id].rs;
   const sid = m.brand?.service_id;
   const cid = m.company?.company_id;
-  if (!sid && !cid) return null;
-  const body = h('div', { class: 'research' }, h('p', { class: 'muted' }, '불러오는 중…'));
-  const det = section('조사 결과', body);
-  det.addEventListener('toggle', async () => {
-    if (!det.open || body.dataset.done) return;
-    try {
-      const db = await loadDb();
-      body.replaceChildren(...[
-        sid ? serviceView(db.services[sid], sid) : null,
-        cid ? companyView(db.companies[cid], cid) : null,
-      ].filter(Boolean));
-      body.dataset.done = '1';
-    } catch (e) {
-      body.replaceChildren(h('p', { class: 'err' }, `조사 DB를 못 불러왔어요: ${errMsg(e)}`));
-    }
-  });
-  return det;
+  try {
+    const db = await loadDb();
+    views.replaceChildren(...[
+      sid ? serviceView(db.services[sid], sid) : null,
+      cid ? companyView(db.companies[cid], cid) : null,
+    ].filter(Boolean));
+    views.dataset.done = '1';
+  } catch (e) {
+    views.replaceChildren(h('p', { class: 'err' }, `조사 DB를 못 불러왔어요: ${errMsg(e)}`));
+  }
 }
 
 function sources(list_) {
   if (!list_?.length) return null;
   return h('span', { class: 'sources' }, list_.map((s, i) => [i ? ' · ' : '', link(s.url || s, `${i + 1}`)]));
+}
+
+// 로그인해야 보이는 곳은 자동 조사에서 빼고 직접 확인 링크로 대신한다.
+const LOGIN_WALLED = /linkedin|glassdoor|indeed|잡플래닛|jobplanet|블라인드|blind|크레딧잡|채용\s*(사이트\s*)?평/i;
+const stillMissing = (list_) => (list_ || []).filter((x) => !LOGIN_WALLED.test(String(x)));
+
+function domainText(dm) {
+  if (!dm?.name) return null;
+  if (!dm.registered) return `${dm.name} · 등록일 ${dm.error || '미확인'}`;
+  const months = Math.floor((Date.now() - Date.parse(dm.registered)) / (30.44 * 864e5));
+  const age = months < 12 ? `${months}개월 전` : `${Math.floor(months / 12)}년 전`;
+  return `${dm.name} · ${dm.registered} 등록 (${age})${months < 12 ? ' ⚠ 1년 미만' : ''}`;
+}
+
+function manualChecks(name) {
+  const n = name.replace(/\s*\(.*\)\s*$/, '');
+  const q = encodeURIComponent(n);
+  const google = (s) => `https://www.google.com/search?q=${encodeURIComponent(s)}`;
+  return h('span', { class: 'sources' },
+    link(`https://www.linkedin.com/search/results/companies/?keywords=${q}`, 'LinkedIn'), ' · ',
+    link(google(`${n} glassdoor`), 'Glassdoor'), ' · ',
+    link(`https://www.jobplanet.co.kr/search?query=${q}`, '잡플래닛'), ' · ',
+    link(`https://www.teamblind.com/kr/search/${q}`, '블라인드'), ' · ',
+    link(google(`"${n}" scam OR 사기 OR 미지급`), 'scam 검색'));
 }
 
 function serviceView(s, sid) {
@@ -526,7 +655,8 @@ function serviceView(s, sid) {
       ['평점', rep.app_ratings],
       ['리뷰', rep.reviews],
       ['논란', rep.controversies],
-      ['미확인', s.missing],
+      ['도메인', domainText(s.domain)],
+      ['미확인', stillMissing(s.missing)],
       ['조사일', s.researched_at],
       ['출처', sources(s.sources)],
     ]),
@@ -548,9 +678,11 @@ function companyView(c, cid) {
       ['블라인드', rv.blind],
       ['Glassdoor', rv.glassdoor],
       ['논란', c.controversies],
-      ['미확인', c.missing],
+      ['도메인', domainText(c.domain)],
+      ['미확인', stillMissing(c.missing)],
       ['조사일', c.researched_at],
       ['출처', sources(c.sources)],
+      ['직접 확인', manualChecks(c.name || cid)],
     ]),
   );
 }
@@ -569,8 +701,13 @@ function draftsView(id) {
     panelEls[i].querySelectorAll('textarea').forEach(autosize);
   };
 
+  entry.draftInputs = [];
+  entry.draftKeys = m.drafts.map((dr) => `${dr.kind}/${dr.lang}`);
+  entry.trEls = [];
+
   m.drafts.forEach((dr, i) => {
     const review = m.lang !== 'ko' && dr.lang === 'ko';
+    const paired = m.lang !== 'ko' && m.drafts.some((x) => x.kind === dr.kind && x.lang === (dr.lang === 'ko' ? 'en' : 'ko'));
     tabEls.push(h('button', { type: 'button', class: 'tab', role: 'tab', onclick: () => select(i) },
       `${KIND[dr.kind] || dr.kind} · ${(dr.lang || '').toUpperCase()}`, review ? ' (검토용)' : '', dr.edited ? ' ✎' : ''));
 
@@ -588,6 +725,20 @@ function draftsView(id) {
       markDirty(id);
     });
     updateWarn();
+    entry.draftInputs[i] = ta;
+    // 번역본이 들어왔을 때 값만 바꾸고 높이·경고를 다시 맞춘다. (input 이벤트는 수정으로 잡히므로 따로)
+    ta.addEventListener('refresh', () => { autosize(ta); updateWarn(); });
+
+    const trStatus = paired ? h('p', { class: 'tr-status', hidden: true }) : null;
+    if (trStatus) entry.trEls.push({ kind: dr.kind, el: trStatus });
+    const trBtn = review && paired
+      ? h('button', {
+        type: 'button',
+        class: 'btn',
+        title: '이 국문본 기준으로 영문 초안을 다시 써요 (1~2분)',
+        onclick: () => startTranslation(id, i),
+      }, '영문에 반영')
+      : null;
 
     panelEls.push(h('div', { class: 'panel', role: 'tabpanel' },
       dr.subject ? h('div', { class: 'subject' },
@@ -597,9 +748,13 @@ function draftsView(id) {
       warn,
       h('div', { class: 'row' },
         h('button', { type: 'button', class: 'btn primary', onclick: () => copyText(ta.value) }, '본문 복사'),
+        trBtn,
         review ? h('span', { class: 'muted' }, '보낼 땐 EN 탭 본문을 복사하세요') : null),
+      trStatus,
     ));
   });
+  renderTranslation(id);
+  if (m.translate_request && !m.translate_request.error) watchTranslation(id);
 
   tabs.append(...tabEls);
   panels.append(...panelEls);
@@ -608,6 +763,180 @@ function draftsView(id) {
   tabEls.forEach((t, j) => t.setAttribute('aria-selected', String(j === first)));
   panelEls.forEach((p, j) => { p.hidden = j !== first; });
   return h('section', { class: 'drafts' }, h('h3', null, '답장 초안'), tabs, panels);
+}
+
+// ---------- 영문 다시 번역 ----------
+
+async function startTranslation(id, i) {
+  const entry = state.mails[id];
+  if (entry.saving || entry.watching) return;
+  const kind = entry.data.drafts[i].kind;
+  const en = entry.data.drafts.findIndex((x) => x.kind === kind && x.lang === 'en');
+  if (entry.pending.drafts[en] != null && !confirm('EN 탭에서 고친 내용이 번역본으로 바뀌어요. 계속할까요?')) return;
+  entry.pending.drafts[i] = entry.draftInputs[i].value;
+  entry.pending.translate = kind;
+  entry.trNote = { kind, text: '국문본 저장 중…' };
+  renderTranslation(id);
+  if (!(await save(id, { quiet: true }))) {
+    entry.trNote = null;
+    renderTranslation(id);
+    return;
+  }
+  try {
+    await dispatch('translate-draft');
+  } catch (e) {
+    entry.trNote = { kind, text: `번역을 시작하지 못했어요: ${errMsg(e)} — 다시 눌러 주세요`, err: true };
+    renderTranslation(id);
+    return;
+  }
+  watchTranslation(id);
+}
+
+function renderTranslation(id) {
+  const entry = state.mails[id];
+  const req = entry.data.translate_request;
+  let note = entry.trNote;
+  if (!note && req?.error) note = { kind: req.kind, text: `번역 실패: ${req.error}`, err: true };
+  else if (!note && req) note = { kind: req.kind, text: '영문 번역 중… 1~2분 뒤 EN 탭이 바뀌어요' };
+  for (const { kind, el } of entry.trEls || []) {
+    const show = note && note.kind === kind;
+    el.hidden = !show;
+    el.textContent = show ? note.text : '';
+    el.classList.toggle('err', !!note?.err);
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 워크플로가 field 요청을 지우거나 error를 남길 때까지 파일을 다시 읽는다.
+// 끝나면 { fresh }, 너무 오래 걸리면 { timeout: true }, 날짜를 옮겨 화면이 바뀌었으면 null.
+async function waitForJob(id, field, waitMs) {
+  const entry = state.mails[id];
+  const started = Date.parse(entry.data[field]?.requested_at) || Date.now();
+  while (state.mails[id] === entry) {
+    await sleep(8000);
+    if (state.mails[id] !== entry) return null;
+    const fresh = await readJson(entry.path).catch(() => null);
+    if (!fresh) continue;
+    const req = fresh.data[field];
+    if (!req || req.error) return { fresh };
+    if (Date.now() - started > waitMs) return { timeout: true };
+  }
+  return null;
+}
+
+async function watchTranslation(id) {
+  const entry = state.mails[id];
+  if (entry.watching) return;
+  entry.watching = true;
+  entry.trNote = null;
+  const kind = entry.data.translate_request?.kind;
+  renderTranslation(id);
+  fillHead(id);
+  try {
+    const r = await waitForJob(id, 'translate_request', TRANSLATE_WAIT_MS);
+    if (r?.timeout) entry.trNote = { kind, text: '번역이 오래 걸리고 있어요. 잠시 뒤 ⟳ 새로고침해 보세요', err: true };
+    else if (r) applyTranslation(id, r.fresh, kind);
+  } finally {
+    entry.watching = false;
+    if (state.mails[id] === entry) {
+      renderTranslation(id);
+      fillHead(id);
+    }
+  }
+}
+
+function applyTranslation(id, fresh, kind) {
+  const entry = state.mails[id];
+  entry.data = fresh.data;
+  entry.sha = fresh.sha;
+  if (fresh.data.translate_request?.error) {
+    toast('영문 번역에 실패했어요', true);
+    return;
+  }
+  const en = fresh.data.drafts?.find((x) => x.kind === kind && x.lang === 'en');
+  const i = (entry.draftKeys || []).indexOf(`${kind}/en`);
+  const ta = entry.draftInputs?.[i];
+  if (!en || !ta) return;
+  if (entry.pending.drafts[i] != null) {
+    entry.trNote = { kind, text: 'EN 탭을 직접 고치던 중이라 번역본으로 바꾸지 않았어요', err: true };
+    return;
+  }
+  ta.value = en.body;
+  ta.dispatchEvent(new Event('refresh'));
+  entry.trNote = { kind, text: '영문 초안에 반영했어요 ✓ EN 탭에서 확인하세요' };
+  toast('영문 초안에 반영했어요');
+}
+
+// ---------- 더 조사 ----------
+
+async function startResearch(id) {
+  const entry = state.mails[id];
+  if (entry.saving || entry.researching) return;
+  entry.pending.research = true;
+  entry.rsNote = { text: '요청 저장 중…' };
+  renderResearch(id);
+  if (!(await save(id, { quiet: true }))) {
+    entry.rsNote = null;
+    renderResearch(id);
+    return;
+  }
+  try {
+    await dispatch('research-more');
+  } catch (e) {
+    entry.rsNote = { text: `조사를 시작하지 못했어요: ${errMsg(e)} — 다시 눌러 주세요`, err: true };
+    renderResearch(id);
+    return;
+  }
+  watchResearch(id);
+}
+
+function renderResearch(id) {
+  const entry = state.mails[id];
+  if (!entry.rs) return;
+  const { status, note, btn } = entry.rs;
+  const req = entry.data.research_request;
+  let s = entry.rsNote;
+  if (!s && req?.error) s = { text: `조사 실패: ${req.error}`, err: true };
+  else if (!s && req) s = { text: '더 조사하는 중… 보통 3~6분 걸려요. 창을 닫아도 계속돼요' };
+  status.hidden = !s;
+  status.textContent = s ? s.text : '';
+  status.classList.toggle('err', !!s?.err);
+  btn.disabled = !!entry.researching;
+  const rn = entry.data.research_note;
+  note.hidden = !rn?.text;
+  note.textContent = rn?.text ? `더 조사 결과 (${fmtTime(rn.at)}) — ${rn.text}` : '';
+}
+
+async function watchResearch(id) {
+  const entry = state.mails[id];
+  if (entry.researching) return;
+  entry.researching = true;
+  entry.rsNote = null;
+  renderResearch(id);
+  fillHead(id);
+  try {
+    const r = await waitForJob(id, 'research_request', RESEARCH_WAIT_MS);
+    if (r?.timeout) {
+      entry.rsNote = { text: '조사가 오래 걸리고 있어요. 잠시 뒤 ⟳ 새로고침해 보세요', err: true };
+    } else if (r) {
+      entry.data = r.fresh.data;
+      entry.sha = r.fresh.sha;
+      if (r.fresh.data.research_request?.error) {
+        toast('더 조사에 실패했어요', true);
+      } else {
+        state.db = null;
+        await fillResearch(id);
+        toast('조사 결과를 반영했어요');
+      }
+    }
+  } finally {
+    entry.researching = false;
+    if (state.mails[id] === entry) {
+      renderResearch(id);
+      fillHead(id);
+    }
+  }
 }
 
 function feedbackView(id) {
@@ -696,11 +1025,11 @@ function renderActions(id) {
 // ---------- 저장 ----------
 
 function emptyPending() {
-  return { drafts: {}, feedback: null, status: null };
+  return { drafts: {}, feedback: null, status: null, translate: null, research: false };
 }
 
 function hasPending(p) {
-  return Object.keys(p.drafts).length > 0 || p.feedback != null || p.status != null;
+  return Object.keys(p.drafts).length > 0 || p.feedback != null || p.status != null || p.translate != null || p.research;
 }
 
 function markDirty(id) {
@@ -731,7 +1060,10 @@ function applyPending(fresh, base, p, now) {
   if (p.status) {
     d.status = p.status;
     if (p.status === 'replied' && !d.replied_at) d.replied_at = now;
+    if (p.status !== 'replied') d.replied_at = null;
   }
+  if (p.translate) d.translate_request = { kind: p.translate, requested_at: now };
+  if (p.research) d.research_request = { requested_at: now };
   return d;
 }
 
@@ -740,16 +1072,21 @@ function commitMessage(id, p, data) {
   if (Object.keys(p.drafts).length) what.push('초안 수정');
   if (p.feedback) what.push('판정 평가');
   if (p.status) what.push(`상태 ${p.status}`);
+  if (p.translate) what.push('영문 번역 요청');
+  if (p.research) what.push('더 조사 요청');
   return `site: ${data.brand?.name || id} ${what.join(', ')}`.trim();
 }
 
-async function save(id) {
+// 저장이 끝까지 됐으면 true. quiet이면 성공 토스트를 띄우지 않는다. (부른 쪽이 따로 알림)
+async function save(id, { quiet = false } = {}) {
   const entry = state.mails[id];
-  if (entry.saving || !hasPending(entry.pending)) return;
+  if (entry.saving || !hasPending(entry.pending)) return false;
   const snap = entry.pending;
   entry.pending = emptyPending();
   entry.saving = true;
+  let ok = false;
   renderActions(id);
+  syncCheck(id);
   try {
     for (let attempt = 0; ; attempt++) {
       const fresh = await readJson(entry.path);
@@ -763,13 +1100,17 @@ async function save(id) {
         throw e;
       }
     }
-    toast('저장했어요');
+    ok = true;
+    if (!quiet) toast('저장했어요');
   } catch (e) {
     const cur = entry.pending;
     entry.pending = {
       drafts: { ...snap.drafts, ...cur.drafts },
       feedback: cur.feedback ?? snap.feedback,
       status: cur.status ?? snap.status,
+      // 번역·조사 요청은 실패하면 다시 누르게 한다
+      translate: null,
+      research: false,
     };
     toast(`저장 실패: ${errMsg(e)}`, true);
   } finally {
@@ -779,7 +1120,9 @@ async function save(id) {
     entry.el.className = cardClass(entry.data) + (entry.detail && !entry.detail.hidden ? ' open' : '');
     fillHead(id);
     renderActions(id);
+    syncCheck(id);
   }
+  return ok;
 }
 
 window.addEventListener('beforeunload', (e) => {
