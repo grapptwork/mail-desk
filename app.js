@@ -14,6 +14,12 @@ const TOKEN_KEY = 'maildesk.token';
 const FILTER_KEY = 'maildesk.filter';
 const PROFILE_OPEN_KEY = 'maildesk.profileOpen';
 
+// 폰에서는 브라우저가 다른 구글 계정이라 Gmail 웹 링크가 안 열린다. 대신 Gmail 앱 작성 화면을 연다.
+const UA = navigator.userAgent || '';
+const IS_IOS = /iPhone|iPad|iPod/i.test(UA) || (/Macintosh/.test(UA) && navigator.maxTouchPoints > 1);
+const IS_ANDROID = /Android/i.test(UA);
+const IS_MOBILE = IS_IOS || IS_ANDROID;
+
 const VERDICT = { green: '🟢', yellow: '🟡', red: '🔴' };
 const VERDICT_NAME = { green: '🟢 초록', yellow: '🟡 노랑', red: '🔴 빨강' };
 const STATUS = { new: '새 메일', reviewed: '검토함', replied: '답장함', archived: '보관' };
@@ -549,13 +555,15 @@ function getCard(id) {
   const head = h('button', { type: 'button', class: 'card-head', 'aria-expanded': 'false' });
   const check = h('input', { type: 'checkbox', class: 'done-check', 'aria-label': '답장 완료', title: '답장 완료' });
   check.addEventListener('change', () => toggleDone(id, check.checked));
-  const gmail = h('a', {
-    class: 'gmail',
-    href: gmailUrl(m),
-    target: '_blank',
-    rel: 'noopener noreferrer',
-    title: 'Gmail에서 이 메일 열기',
-  }, '답장 ↗');
+  const gmail = IS_MOBILE
+    ? h('button', { type: 'button', class: 'gmail', title: 'Gmail 앱에서 답장 쓰기', onclick: () => replyInApp(id) }, '답장 ↗')
+    : h('a', {
+      class: 'gmail',
+      href: gmailUrl(m),
+      target: '_blank',
+      rel: 'noopener noreferrer',
+      title: 'Gmail에서 이 메일 열기',
+    }, '답장 ↗');
   const card = h('article', { class: cardClass(m), id: `m-${id}` },
     h('div', { class: 'card-row' }, check, head, gmail));
   head.addEventListener('click', () => toggleCard(id));
@@ -569,6 +577,52 @@ function getCard(id) {
 
 function gmailUrl(m) {
   return `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(GMAIL_ACCOUNT)}#all/${m.thread_id || m.id}`;
+}
+
+// Gmail 앱 작성 화면. iOS는 googlegmail:///co, 안드로이드는 Gmail 앱을 지정한 mailto 인텐트.
+// 앱에서는 보내는 계정을 고를 수 없어서(from 미지원) 앱에 선택된 계정으로 열린다.
+function composeUrl(to, subject, body) {
+  const q = (o) => Object.entries(o).filter(([, v]) => v).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+  if (IS_IOS) return `googlegmail:///co?${q({ to, subject, body })}`;
+  if (IS_ANDROID) return `intent:${encodeURIComponent(to || '')}?${q({ subject, body })}#Intent;scheme=mailto;package=com.google.android.gm;end`;
+  return null;
+}
+
+function replySubject(m, dr) {
+  if (dr?.subject) return dr.subject;
+  if (!m.subject) return '';
+  return /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`;
+}
+
+// 보낼 초안: 해외 건은 EN, 국내 건은 KO. 없으면 -1.
+function sendIndex(m) {
+  const want = m.lang === 'ko' ? 'ko' : 'en';
+  const i = (m.drafts || []).findIndex((dr) => dr.lang === want);
+  return i >= 0 ? i : (m.drafts?.length ? 0 : -1);
+}
+
+function openCompose(id, i) {
+  const entry = state.mails[id];
+  const m = entry.data;
+  const dr = i >= 0 ? m.drafts[i] : null;
+  // 화면에서 고치던 본문이 있으면 그걸 보낸다.
+  const body = i >= 0 ? (entry.draftInputs?.[i]?.value ?? dr.body ?? '') : '';
+  const n = (body.match(/\[확인필요/g) || []).length;
+  if (n && !confirm(`[확인필요] ${n}곳이 남아 있어요. 그래도 Gmail 앱을 열까요?`)) return;
+  location.href = composeUrl(m.from?.email, replySubject(m, dr), body);
+}
+
+// 카드의 「답장」 버튼 (폰). 초안이 한 종류면 바로 작성 화면, 수락·거절처럼 여러 종류면 초안 탭으로 보낸다.
+function replyInApp(id) {
+  const entry = state.mails[id];
+  const kinds = new Set((entry.data.drafts || []).map((dr) => dr.kind));
+  if (kinds.size > 1) {
+    openCard(id);
+    entry.detail.querySelector('.drafts')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    toast('보낼 초안 탭에서 「Gmail 앱으로」를 눌러 주세요');
+    return;
+  }
+  openCompose(id, sendIndex(entry.data));
 }
 
 const isDone = (status) => status === 'replied' || status === 'archived';
@@ -696,7 +750,7 @@ function buildDetail(id) {
 
   d.append(h('div', { class: 'meta' },
     h('div', null, h('b', null, m.from?.name || ''), ' ', h('span', { class: 'muted' }, m.from?.email || ''),
-      ' · ', link(gmailUrl(m), 'Gmail에서 열기')),
+      IS_MOBILE ? null : [' · ', link(gmailUrl(m), 'Gmail에서 열기')]),
     h('div', null, m.subject || ''),
     h('div', { class: 'muted' }, `받음 ${fmtTime(m.received_at)}`,
       m.company?.name ? ` · ${m.company.name}` : '',
@@ -718,9 +772,10 @@ function buildDetail(id) {
   if (m.changes_from_previous) d.append(h('div', { class: 'note' }, `이전과 달라진 점: ${m.changes_from_previous}`));
 
   if (a.needs_user_input?.length) d.append(section('정원 확인 필요', list(a.needs_user_input), { open: true, cls: 'ask' }));
-  if (m.verdict_reasons?.length) d.append(section('판정 근거', list(m.verdict_reasons), { open: true }));
 
-  d.append(section('분석', h('div', null,
+  d.append(section('메일 내용 및 분석', h('div', null,
+    h('p', { class: 'label' }, '메일 내용'),
+    h('div', { class: 'body mailbody' }, m.body || '(내용 없음)'),
     a.questions?.length ? h('div', null, h('p', { class: 'label' }, '상대 질문'), list(a.questions, true)) : null,
     kv([
       ['형태', a.collab_type ? `${COLLAB[a.collab_type] || a.collab_type}${a.content_count ? ` · ${a.content_count}편` : ''}` : null],
@@ -731,8 +786,6 @@ function buildDetail(id) {
     ]),
     a.risks?.length ? h('div', null, h('p', { class: 'label' }, '유의점'), list(a.risks)) : null,
   )));
-
-  d.append(section('메일 내용', h('div', { class: 'body' }, m.body || '(내용 없음)')));
 
   const research = researchSection(id);
   if (research) d.append(research);
@@ -746,7 +799,11 @@ function buildDetail(id) {
 function researchSection(id) {
   const entry = state.mails[id];
   const m = entry.data;
-  if (!m.brand?.service_id && !m.company?.company_id) return null;
+  const hasDb = !!(m.brand?.service_id || m.company?.company_id);
+  const reasons = m.verdict_reasons?.length
+    ? h('div', null, h('p', { class: 'label' }, `판정 근거${m.verdict ? ` ${VERDICT[m.verdict]}` : ''}`), list(m.verdict_reasons))
+    : null;
+  if (!hasDb) return reasons ? section('조사 결과', reasons) : null;
   const views = h('div', null, h('p', { class: 'muted' }, '불러오는 중…'));
   const btn = h('button', {
     type: 'button',
@@ -761,10 +818,11 @@ function researchSection(id) {
     note: h('div', { class: 'note', hidden: true }),
   };
   const det = section('조사 결과', h('div', { class: 'research' },
-    h('div', { class: 'row' }, btn, h('span', { class: 'muted' }, '판정에 필요한 항목을 조금 더 찾아요')),
-    entry.rs.status,
+    reasons,
     entry.rs.note,
-    views));
+    views,
+    h('div', { class: 'row' }, btn),
+    entry.rs.status));
   det.addEventListener('toggle', () => {
     if (det.open && !views.dataset.done) fillResearch(id);
   });
@@ -818,13 +876,17 @@ function manualChecks(name) {
     link(google(`"${n}" scam OR 사기 OR 미지급`), 'scam 검색'));
 }
 
+// 서비스·발신 회사는 각각 접었다 펴는 칸. 처음엔 접혀 있다.
+function dbToggle(title, content) {
+  return h('details', { class: 'db' }, h('summary', null, title.trim()), content);
+}
+
 function serviceView(s, sid) {
-  if (!s) return h('div', { class: 'db' }, h('h4', null, `서비스 ${sid}`), h('p', { class: 'muted' }, '조사 기록 없음'));
+  if (!s) return dbToggle(`서비스 · ${sid}`, h('p', { class: 'muted' }, '조사 기록 없음'));
   const op = s.operator || {};
   const pa = s.parent || {};
   const rep = s.reputation || {};
-  return h('div', { class: 'db' },
-    h('h4', null, `서비스 · ${s.name || sid} ${VERDICT[s.verdict_hint] || ''}`),
+  return dbToggle(`서비스 · ${s.name || sid} ${VERDICT[s.verdict_hint] || ''}`,
     kv([
       ['운영사', [op.legal_name || '법인명 미확인', op.country].filter(Boolean).join(' · ')],
       ['모회사', pa.name ? `${pa.name}${pa.country ? ` · ${pa.country}` : ''}${pa.confidence ? ` (${pa.confidence})` : ''}` : null],
@@ -843,10 +905,9 @@ function serviceView(s, sid) {
 }
 
 function companyView(c, cid) {
-  if (!c) return h('div', { class: 'db' }, h('h4', null, `발신 회사 ${cid}`), h('p', { class: 'muted' }, '조사 기록 없음'));
+  if (!c) return dbToggle(`발신 회사 · ${cid}`, h('p', { class: 'muted' }, '조사 기록 없음'));
   const rv = c.reviews || {};
-  return h('div', { class: 'db' },
-    h('h4', null, `발신 회사 · ${c.name || cid} ${VERDICT[c.verdict_hint] || ''}`),
+  return dbToggle(`발신 회사 · ${c.name || cid} ${VERDICT[c.verdict_hint] || ''}`,
     kv([
       ['유형', COMPANY_TYPE[c.type] || c.type],
       ['국가', c.country],
@@ -929,6 +990,9 @@ function draftsView(id) {
       warn,
       h('div', { class: 'row' },
         h('button', { type: 'button', class: 'btn primary', onclick: () => copyText(ta.value) }, '본문 복사'),
+        IS_MOBILE && !review
+          ? h('button', { type: 'button', class: 'btn', title: '제목·받는 사람·본문을 채운 Gmail 앱 작성 화면을 열어요', onclick: () => openCompose(id, i) }, 'Gmail 앱으로')
+          : null,
         trBtn,
         review ? h('span', { class: 'muted' }, '보낼 땐 EN 탭 본문을 복사하세요') : null),
       trStatus,

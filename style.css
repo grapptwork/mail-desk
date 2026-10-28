@@ -153,6 +153,7 @@ code { background: var(--soft); padding: 1px 5px; border-radius: 4px; font-size:
   white-space: nowrap;
 }
 .gmail:hover { background: var(--soft); }
+button.gmail { font: inherit; font-size: 12px; color: var(--accent); background: none; cursor: pointer; }
 
 .card-head {
   display: block;
@@ -188,8 +189,11 @@ code { background: var(--soft); padding: 1px 5px; border-radius: 4px; font-size:
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 6px 0; font-size: 14px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; overflow-wrap: anywhere; }
-.db { margin: 8px 0 12px; }
-.db h4 { margin: 4px 0; font-size: 14px; }
+.db { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 6px 0; }
+.db > summary { cursor: pointer; font-size: 14px; font-weight: 600; }
+.db[open] > summary { margin-bottom: 4px; }
+.research > div:first-child > .label:first-child { margin-top: 2px; }
+.mailbody { background: var(--soft); border-radius: 8px; padding: 8px 10px; margin: 4px 0 6px; }
 
 /* 초안 */
 .drafts, .feedback, .actions { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 4px; }
