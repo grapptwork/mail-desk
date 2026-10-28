@@ -306,6 +306,30 @@ textarea.draft:focus { background: var(--card); border-color: var(--line); }
 .regen .label { font-size: 12.5px; color: var(--muted); margin: 0 0 6px; }
 .note-input { min-height: 60px; font-size: 13px; }
 
+/* 답장 방향 버튼 */
+.dirs .dir-hint { margin: 8px 0 10px; }
+.dir-list { display: grid; gap: 8px; }
+.dir {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px; width: 100%;
+  padding: 11px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card);
+  text-align: left; cursor: pointer;
+}
+.dir:hover { background: var(--soft); }
+.dir[aria-checked="true"] { border-color: var(--ink); box-shadow: 0 0 0 1px var(--ink); background: var(--card); }
+.dir:disabled { opacity: .55; cursor: default; }
+.dir-top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13.5px; color: var(--text); }
+.dir-top b { font-weight: 600; }
+.dir small { font-size: 12.5px; line-height: 1.55; color: var(--muted); }
+.dir-type { flex: none; height: 20px; padding: 0 7px; display: inline-flex; align-items: center; border-radius: 999px; border: 1px solid var(--line); font-size: 11px; font-weight: 600; color: var(--text-2); }
+.t-accept .dir-type { color: #168A52; border-color: rgba(29, 179, 107, .35); }
+.t-adjust .dir-type { color: #946B00; border-color: rgba(232, 167, 0, .4); }
+.t-decline .dir-type { color: #C7363C; border-color: rgba(229, 72, 77, .35); }
+.t-other .dir-top b { color: var(--text-2); }
+.dir-rec { height: 20px; padding: 0 7px; display: inline-flex; align-items: center; border-radius: 999px; background: var(--ink); color: #fff; font-size: 11px; font-weight: 600; }
+.dir-chosen { display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; color: var(--muted); }
+.dir-chosen svg.i { width: 13px; height: 13px; }
+.dir-go { margin-top: 10px; }
+
 /* 상태 · 판정 평가 */
 .status-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .segs { display: flex; align-items: center; gap: 2px; padding: 3px; border-radius: 10px; background: var(--soft); }

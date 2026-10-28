@@ -38,7 +38,12 @@ const STATUS = { new: '새 메일', reviewed: '검토함', replied: '답장함',
 
 const CATEGORY_LABEL = { collab_followup: '후속', collab_duplicate: '중복', personal: '개인 메일' };
 
-const KIND = { default: '초안', positive: '수락', decline: '거절', followup: '후속' };
+const KIND = { default: '초안', positive: '수락', adjust: '조율', decline: '거절', ask: '확인 질문', followup: '후속' };
+
+// 답장 방향 버튼 type → 이름, 초안 kind
+const DIR_TYPE = { accept: '수락', adjust: '조율', decline: '거절', ask: '확인' };
+
+const DIR_KIND = { accept: 'positive', adjust: 'adjust', decline: 'decline', ask: 'ask' };
 
 const COLLAB = { single: '단건', multi: '다건', long_term: '장기', unknown: '미정' };
 
@@ -496,6 +501,8 @@ function profileBox() {
   rows.push(['광고 가능 시작일', f.available_from, hints.available_from]);
   f.schedule_note = h('input', { type: 'text', class: 'input', placeholder: '예: 12/1~12/10 불가', disabled: true });
   rows.push(['일정 메모', f.schedule_note, null]);
+  f.active_brands = h('input', { type: 'text', class: 'input', placeholder: '예: 캡컷 (11/18까지)', disabled: true });
+  rows.push(['진행 중 브랜드', f.active_brands, null]);
   f.memo = h('textarea', {
     class: 'input memo-input',
     rows: '2',
@@ -553,6 +560,7 @@ function renderPfCard() {
     h('small', { class: stale ? 'warn-text' : null }, folChecked ? `${md(folChecked)} 확인${stale ? ' · 오래됨' : ''}` : '')));
   if (from || d.schedule_note) rows.push(h('div', { class: 'pf' }, h('span', null, '광고 가능'),
     h('b', null, from ? `${md(from)}~` : '-'), h('small', null, d.schedule_note || '')));
+  if (d.active_brands) rows.push(h('div', { class: 'pf' }, h('span', null, '진행 중'), h('small', { class: 'pf-memo' }, d.active_brands)));
   if (d.memo) rows.push(h('div', { class: 'pf' }, h('span', null, '메모'), h('small', { class: 'pf-memo' }, d.memo)));
   if (!state.profile.loaded) rows.push(h('p', { class: 'muted small' }, '불러오는 중…'));
   else if (!rows.length) rows.push(h('p', { class: 'muted small' }, '비어 있어요 · 기존 기준대로 답해요'));
@@ -563,6 +571,7 @@ function renderPfCard() {
     folChecked && fol && `${md(folChecked)} 확인`,
     from && `광고 가능 ${md(from)}~`,
     d.schedule_note && '일정 메모',
+    d.active_brands && `진행 중 ${d.active_brands.split(/[,(（]/)[0].trim()}`,
     d.memo && '메모',
   ].filter(Boolean);
   pfStrip.replaceChildren(icon('chart'),
@@ -625,6 +634,7 @@ async function saveProfile() {
   }
   data.available_from = f.available_from.value || null;
   data.schedule_note = f.schedule_note.value.trim();
+  data.active_brands = f.active_brands.value.trim();
   data.memo = f.memo.value.trim();
   data.updated_at = nowKst();
   pf.saving = true;
@@ -770,11 +780,16 @@ function snippet(id, m) {
 
 function draftTag(m) {
   const ds = m.drafts || [];
-  if (!ds.length) return null;
+  if (!ds.length) {
+    if (m.regenerate_request && !m.regenerate_request.error) return null;
+    return m.directions?.options?.length && !isDone(m.status) ? '방향 고르기' : null;
+  }
   const kinds = new Set(ds.map((d) => d.kind));
   if (kinds.has('followup')) return '후속 초안';
   if (kinds.has('positive') && kinds.has('decline')) return '초안 수락·거절';
-  return new Set(ds.map((d) => d.lang)).size > 1 ? '초안 KO·EN' : '초안';
+  const k = ds[0].kind;
+  const name = k && k !== 'default' && KIND[k] ? `${KIND[k]} 초안` : '초안';
+  return new Set(ds.map((d) => d.lang)).size > 1 ? `${name} KO·EN` : name;
 }
 
 const md = (iso) => (iso ? `${iso.slice(5, 7)}/${iso.slice(8, 10)}` : '');
@@ -1140,6 +1155,8 @@ function buildDetail(id) {
 
   const d = h('div', { class: 'd-wrap' }, head, h('div', { class: 'd-grid' }, main, researchSection(id)));
   if (m.research_request && !m.research_request.error) watchResearch(id);
+  const dirs = directionsView(id);
+  if (dirs) d.append(dirs);
   if (m.drafts?.length) d.append(draftsView(id));
   d.append(actionsView(id), feedbackView(id));
   return d;
@@ -1368,8 +1385,185 @@ function draftsView(id) {
   entry.tab = first;
   const regen = regenBox(id);
   renderRegen(id);
-  if (m.regenerate_request && !m.regenerate_request.error) watchRegenerate(id);
+  if (m.regenerate_request && !m.regenerate_request.error && !m.regenerate_request.direction) watchRegenerate(id);
   return h('section', { class: 'drafts' }, h('div', { class: 'd-top' }, h('h3', null, '답장 초안'), tabs), panels, regen);
+}
+
+// ---------- 답장 방향 ----------
+// 라우틴이 추천한 방향 버튼(directions.options) + 늘 붙는 「기타」. 고르면 그 방향으로 초안을 새로 쓴다.
+// 처리는 「초안 다시 쓰기」와 같은 워크플로(regenerate_request + direction)가 한다.
+
+const OTHER = { id: 'other', type: null, label: '기타 — 직접 쓰기', detail: '원하는 답장 방향을 아래에 적어 주세요' };
+
+// 「거절 — 같은 브랜드 진행 중」 → 「같은 브랜드 진행 중」 (type은 칩으로 따로 보여준다)
+const dirText = (o) => String(o.label || '').replace(/^\s*(수락|조율|거절|확인(\s*질문)?)\s*[—–\-:·]\s*/, '') || o.label || '';
+
+function directionsView(id) {
+  const entry = state.mails[id];
+  const m = entry.data;
+  const opts = m.directions?.options || [];
+  const hasDraft = !!m.drafts?.length;
+  const req = m.regenerate_request;
+  // 방향 추천이 없는 메일은 초안도 없고 답장 전일 때만 「기타」로 직접 방향을 적게 한다.
+  if (!opts.length && (hasDraft || m.category === 'collab_duplicate' || isDone(m.status)) && !req?.direction) return null;
+
+  const dv = entry.dv = { pick: null, btns: [] };
+  const chosen = m.directions?.chosen;
+  for (const o of [...opts, OTHER]) {
+    const b = h('button', {
+      type: 'button',
+      class: `dir t-${o.type || 'other'}`,
+      role: 'radio',
+      'aria-checked': 'false',
+      onclick: () => pickDirection(id, o),
+    },
+    h('span', { class: 'dir-top' },
+      o.type ? h('span', { class: 'dir-type' }, DIR_TYPE[o.type] || o.type) : null,
+      h('b', null, o.id === 'other' ? '기타 · 직접 쓰기' : dirText(o)),
+      o.recommended ? h('span', { class: 'dir-rec' }, '추천') : null,
+      chosen?.id === o.id ? h('span', { class: 'dir-chosen' }, icon('tick'), '고름') : null),
+    o.detail ? h('small', null, o.detail) : null);
+    dv.btns.push({ o, el: b });
+  }
+  dv.memo = h('textarea', { class: 'input note-input', rows: '2' });
+  dv.memo.addEventListener('input', () => autosize(dv.memo));
+  dv.go = h('button', { type: 'button', class: 'btn dark', onclick: () => startDirection(id) });
+  dv.cancel = h('button', { type: 'button', class: 'btn ghost', onclick: () => pickDirection(id, null) }, '취소');
+  dv.box = h('div', { class: 'dir-go', hidden: true }, dv.memo, h('div', { class: 'd-acts' }, dv.go, dv.cancel));
+  dv.status = h('p', { class: 'tr-status', hidden: true });
+
+  const title = hasDraft && chosen ? `답장 방향 · ${chosen.label}` : '답장 방향';
+  const wrap = h('details', { class: 'sec dirs', open: !hasDraft },
+    h('summary', null, title, icon('chev', 'chev')),
+    h('p', { class: 'muted small dir-hint' }, hasDraft
+      ? '다른 방향을 고르면 지금 초안 대신 새로 써요.'
+      : '방향을 고르면 그 방향으로 초안을 써요 (1~3분).'),
+    h('div', { class: 'dir-list', role: 'radiogroup', 'aria-label': '답장 방향' }, dv.btns.map((x) => x.el)),
+    dv.box);
+  dv.wrap = wrap;
+  renderDir(id);
+  if (req?.direction && !req.error) watchDirection(id);
+  return h('div', null, wrap, dv.status);
+}
+
+function pickDirection(id, o) {
+  const dv = state.mails[id].dv;
+  if (!dv) return;
+  dv.pick = dv.pick?.id === o?.id ? null : o;
+  renderDir(id);
+  if (dv.pick) requestAnimationFrame(() => (dv.pick.id === 'other' ? dv.memo.focus() : dv.go.scrollIntoView({ block: 'nearest' })));
+}
+
+function renderDir(id) {
+  const entry = state.mails[id];
+  const dv = entry?.dv;
+  if (!dv) return;
+  const busy = !!(entry.dirBusy || entry.saving || entry.regenerating);
+  for (const { o, el } of dv.btns) {
+    el.setAttribute('aria-checked', String(dv.pick?.id === o.id));
+    el.disabled = busy;
+  }
+  dv.box.hidden = !dv.pick;
+  const other = dv.pick?.id === 'other';
+  dv.memo.placeholder = other
+    ? '예: 이번 건은 거절하되, 12월 이후엔 가능하다고 써줘'
+    : '메모 (선택) — 예: 단가는 빼고 짧게';
+  const hasDraft = !!entry.data.drafts?.length;
+  dv.go.textContent = entry.dirBusy ? '초안 쓰는 중…' : hasDraft ? '이 방향으로 다시 쓰기' : '이 방향으로 초안 쓰기';
+  dv.go.disabled = busy;
+  dv.cancel.disabled = busy;
+
+  const req = entry.data.regenerate_request;
+  let note = entry.dirNote;
+  if (!note && req?.direction && req.error) note = { text: `초안 쓰기 실패: ${req.error} — 다시 골라 주세요`, err: true };
+  else if (!note && req?.direction) note = { text: `「${req.direction.label}」 방향으로 초안 쓰는 중… 1~3분 걸려요. 창을 닫아도 계속돼요` };
+  dv.status.hidden = !note;
+  dv.status.textContent = note ? note.text : '';
+  dv.status.classList.toggle('err', !!note?.err);
+}
+
+async function startDirection(id) {
+  const entry = state.mails[id];
+  const dv = entry.dv;
+  const o = dv?.pick;
+  if (!o || entry.saving || entry.dirBusy || entry.regenerating) return;
+  if (entry.watching) {
+    toast('영문 번역이 끝난 뒤에 눌러 주세요', true);
+    return;
+  }
+  const comment = dv.memo.value.trim();
+  if (o.id === 'other' && !comment) {
+    toast('어떤 방향으로 쓸지 적어 주세요', true);
+    dv.memo.focus();
+    return;
+  }
+  const m = entry.data;
+  const editing = Object.keys(entry.pending.drafts).length > 0 || (m.drafts || []).some((x) => x.edited && !x.regenerated_at);
+  if (m.drafts?.length && !confirm(editing ? '직접 고친 초안이 새 방향 초안으로 바뀌어요. 계속할까요?' : '지금 초안 대신 이 방향으로 새로 써요. 계속할까요?')) return;
+  // 고치던 초안은 버린다 (새로 쓰므로)
+  entry.pending.drafts = {};
+  const direction = { id: o.id, type: o.type || null, label: o.id === 'other' ? '기타' : o.label, detail: o.id === 'other' ? '' : (o.detail || '') };
+  const kind = o.type ? (m.category === 'collab_followup' && o.type !== 'decline' ? 'followup' : DIR_KIND[o.type] || 'default') : 'default';
+  entry.pending.regenerate = { kind, direction, comment };
+  entry.pending.choose = { id: direction.id, type: direction.type, label: direction.label, note: comment };
+  entry.dirNote = { text: '저장 중…' };
+  renderDir(id);
+  if (!(await save(id, { quiet: true }))) {
+    entry.dirNote = null;
+    renderDir(id);
+    return;
+  }
+  try {
+    await dispatch('regenerate-draft');
+  } catch (e) {
+    entry.dirNote = { text: `초안 쓰기를 시작하지 못했어요: ${errMsg(e)} — 다시 눌러 주세요`, err: true };
+    renderDir(id);
+    return;
+  }
+  dv.memo.value = '';
+  watchDirection(id);
+}
+
+async function watchDirection(id) {
+  const entry = state.mails[id];
+  if (entry.dirBusy) return;
+  entry.dirBusy = true;
+  entry.dirNote = null;
+  renderDir(id);
+  fillHead(id);
+  let rebuilt = false;
+  try {
+    const r = await waitForJob(id, 'regenerate_request', REGEN_WAIT_MS);
+    if (r?.timeout) entry.dirNote = { text: '초안 쓰기가 오래 걸리고 있어요. 잠시 뒤 ⟳ 새로고침해 보세요', err: true };
+    else if (r) {
+      entry.data = r.fresh.data;
+      entry.sha = r.fresh.sha;
+      if (r.fresh.data.regenerate_request?.error) toast('초안 쓰기에 실패했어요', true);
+      else {
+        toast('초안을 썼어요');
+        rebuildDetail(id);
+        rebuilt = true;
+      }
+    }
+  } finally {
+    entry.dirBusy = false;
+    if (state.mails[id] === entry) {
+      if (!rebuilt) renderDir(id);
+      fillHead(id);
+    }
+  }
+}
+
+// 초안이 새로 생기면 상세 화면을 통째로 다시 만든다.
+function rebuildDetail(id) {
+  const entry = state.mails[id];
+  entry.detail = null;
+  entry.dv = null;
+  entry.rg = null;
+  entry.draftInputs = [];
+  entry.draftKeys = [];
+  entry.trEls = [];
+  if (state.sel === id) renderDetailPane();
 }
 
 // ---------- 초안 다시 쓰기 ----------
@@ -1802,12 +1996,12 @@ function renderActions(id) {
 // ---------- 저장 ----------
 
 function emptyPending() {
-  return { drafts: {}, feedback: null, status: null, translate: null, research: false, regenerate: null, swap: null };
+  return { drafts: {}, feedback: null, status: null, translate: null, research: false, regenerate: null, swap: null, choose: null };
 }
 
 function hasPending(p) {
   return Object.keys(p.drafts).length > 0 || p.feedback != null || p.status != null || p.translate != null ||
-    p.research || p.regenerate != null || p.swap != null;
+    p.research || p.regenerate != null || p.swap != null || p.choose != null;
 }
 
 function markDirty(id) {
@@ -1830,11 +2024,18 @@ function applyPending(fresh, base, p, now) {
       t = d.drafts?.find((x) => x.kind === orig.kind && x.lang === orig.lang);
     }
     if (!t || t.body === body) continue;
+    // 정원이 무엇을 고쳤는지 답변 패턴 정리에서 보도록, 처음 고칠 때의 본문을 한 번만 남긴다.
+    if (t.original_body == null) t.original_body = t.body;
     t.body = body;
     t.edited = true;
     t.edited_at = now;
   }
-  if (p.feedback) d.feedback = { ...(d.feedback || {}), ...p.feedback };
+  if (p.feedback) {
+    const noteChanged = (p.feedback.note || '') !== (d.feedback?.note || '');
+    d.feedback = { ...(d.feedback || {}), ...p.feedback };
+    if (noteChanged) d.feedback.updated_at = now;
+  }
+  if (p.choose) d.directions = { options: [], ...(d.directions || {}), chosen: { ...p.choose, chosen_at: now } };
   if (p.status) {
     d.status = p.status;
     if (p.status === 'replied' && !d.replied_at) d.replied_at = now;
@@ -1861,7 +2062,8 @@ function commitMessage(id, p, data) {
   if (p.status) what.push(`상태 ${p.status}`);
   if (p.translate) what.push('영문 번역 요청');
   if (p.research) what.push('더 조사 요청');
-  if (p.regenerate) what.push('초안 다시 쓰기 요청');
+  if (p.choose) what.push(`답장 방향 「${p.choose.label}」`);
+  else if (p.regenerate) what.push('초안 다시 쓰기 요청');
   if (p.swap) what.push('이전 초안으로');
   return `site: ${data.brand?.name || id} ${what.join(', ')}`.trim();
 }
@@ -1876,6 +2078,7 @@ async function save(id, { quiet = false } = {}) {
   let ok = false;
   renderActions(id);
   renderRegen(id);
+  renderDir(id);
   syncCheck(id);
   try {
     for (let attempt = 0; ; attempt++) {
@@ -1903,6 +2106,7 @@ async function save(id, { quiet = false } = {}) {
       research: false,
       regenerate: null,
       swap: null,
+      choose: null,
     };
     toast(`저장 실패: ${errMsg(e)}`, true);
   } finally {
@@ -1913,6 +2117,7 @@ async function save(id, { quiet = false } = {}) {
     fillHead(id);
     renderActions(id);
     renderRegen(id);
+    renderDir(id);
     syncCheck(id);
   }
   return ok;
