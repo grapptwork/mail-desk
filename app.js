@@ -599,6 +599,20 @@ function openInGmailApp(m) {
   location.href = 'googlegmail://';
 }
 
+// [임시 · 2026-10-28] 아이폰에서 메일 하나를 바로 여는 방법 시험. 되는 걸 찾으면 「Gmail에서 열기」에 넣고 이 줄은 지운다.
+// 1~3: 비공식 Gmail 앱 링크(googlegmail:///cv=스레드ID/accountId=앱 계정 순번). 4: 크롬 앱으로 Gmail 웹 열기.
+function openTestRow(m) {
+  const tid = m.thread_id || m.id;
+  const a = (label, href) => h('a', { class: 'btn small', href }, label);
+  return h('div', { class: 'note opentest' },
+    h('div', null, '메일 바로 열기 시험 — 하나씩 눌러보고 어느 게 이 메일로 가는지 알려주세요'),
+    h('div', { class: 'row' },
+      a('1', `googlegmail:///cv=${tid}/accountId=0`),
+      a('2', `googlegmail:///cv=${tid}/accountId=1`),
+      a('3', `googlegmail:///cv=${tid}/accountId=2`),
+      a('4 크롬', gmailUrl(m).replace(/^https:/, 'googlechromes:'))));
+}
+
 function replySubject(m, dr) {
   if (dr?.subject) return dr.subject;
   if (!m.subject) return '';
@@ -769,6 +783,8 @@ function buildDetail(id) {
       m.company?.name ? ` · ${m.company.name}` : '',
       m.company?.type ? ` (${COMPANY_TYPE[m.company.type] || m.company.type})` : ''),
   ));
+
+  if (IS_IOS) d.append(openTestRow(m));
 
   if (m.deadline) {
     d.append(h('div', { class: 'alert' }, `회신 기한 ${m.deadline.date}`,
