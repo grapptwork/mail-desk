@@ -1,31 +1,47 @@
 'use strict';
-
 // 데이터는 비공개 repo에 있고, 정원이 발급한 fine-grained 토큰(이 repo만 Contents 읽기·쓰기)으로 읽고 쓴다.
 // 형식: 비공개 repo의 automation/스키마.md
 const REPO = 'grapptwork/instagram-mail-reply';
+
 const BRANCH = 'main';
+
 const API = 'https://api.github.com';
+
 const GMAIL_ACCOUNT = 'contact@grappt.co.kr';
+
 const TRANSLATE_WAIT_MS = 5 * 60e3;
+
 const RESEARCH_WAIT_MS = 15 * 60e3;
+
 const REGEN_WAIT_MS = 6 * 60e3;
+
 const PROFILE_PATH = 'db/profile.json';
+
 const TOKEN_KEY = 'maildesk.token';
-const FILTER_KEY = 'maildesk.filter';
-const PROFILE_OPEN_KEY = 'maildesk.profileOpen';
+
+const FILTER_KEY = 'maildesk.filter2';
 
 // 폰에서는 브라우저가 다른 구글 계정이라 Gmail 웹 링크가 안 열린다. 대신 Gmail 앱 작성 화면을 연다.
 const UA = navigator.userAgent || '';
+
 const IS_IOS = /iPhone|iPad|iPod/i.test(UA) || (/Macintosh/.test(UA) && navigator.maxTouchPoints > 1);
+
 const IS_ANDROID = /Android/i.test(UA);
+
 const IS_MOBILE = IS_IOS || IS_ANDROID;
 
-const VERDICT = { green: '🟢', yellow: '🟡', red: '🔴' };
-const VERDICT_NAME = { green: '🟢 초록', yellow: '🟡 노랑', red: '🔴 빨강' };
+const VERDICT_LABEL = { green: '초록', yellow: '노랑', red: '빨강' };
+
+const VERDICT_NAME = { green: '초록', yellow: '노랑', red: '빨강' };
+
 const STATUS = { new: '새 메일', reviewed: '검토함', replied: '답장함', archived: '보관' };
-const STATUS_ICON = { reviewed: '👀', replied: '✅', archived: '📦' };
+
+const CATEGORY_LABEL = { collab_followup: '후속', collab_duplicate: '중복', personal: '개인 메일' };
+
 const KIND = { default: '초안', positive: '수락', decline: '거절', followup: '후속' };
+
 const COLLAB = { single: '단건', multi: '다건', long_term: '장기', unknown: '미정' };
+
 const COMPANY_TYPE = { agency: '대행사', brand: '브랜드 직접', unknown: '미확인' };
 
 const state = {
@@ -33,17 +49,56 @@ const state = {
   dates: [],
   date: null,
   digest: null,
-  mails: {},      // id -> { path, data, sha, pending, saving, el }
+  mails: {},      // id -> { path, data, sha, pending, saving, el(목록 행), detail(상세), ... }
   order: [],
   dirty: new Set(),
   db: null,       // Promise<{services, companies}>
   filter: lsGet(FILTER_KEY) || 'todo',
+  query: '',
+  sel: null,      // 보고 있는 메일 id
+  ui: {},         // 화면 틀의 고정 요소들
   profile: { data: null, sha: null, loaded: false, saving: false, error: null, el: null },
 };
 
-// ---------- 작은 도구 ----------
+// 폰 폭이면 목록·상세를 한 장씩 보여준다.
+const MQ = matchMedia('(max-width: 900px)');
+const isNarrow = () => MQ.matches;
+
+// 선 아이콘. index.html 안의 SVG 묶음(#i-…)을 가져다 쓴다.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function icon(name, cls) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', `i${cls ? ` ${cls}` : ''}`);
+  svg.setAttribute('aria-hidden', 'true');
+  const use = document.createElementNS(SVG_NS, 'use');
+  use.setAttribute('href', `#i-${name}`);
+  svg.append(use);
+  return svg;
+}
+
+const dot = (v) => h('span', { class: `vd ${v}` });
+
+// 이름 → 두 글자 이니셜. CapCut → CC, Abacus AI → AA, 한글은 첫 글자.
+function initials(name) {
+  const s = String(name || '?').replace(/\(.*?\)/g, '').trim();
+  if (!s) return '?';
+  if (/^[가-힣]/.test(s)) return s[0];
+  const words = s.split(/[\s._-]+/).filter(Boolean);
+  if (words.length > 1) return (words[0][0] + words[1][0]).toUpperCase();
+  const caps = s.match(/[A-Z]/g);
+  if (caps && caps.length >= 2) return caps.slice(0, 2).join('');
+  return s.slice(0, 2).toUpperCase();
+}
+
+const AV_TONES = 5;
+function avatar(name, cls) {
+  let n = 0;
+  for (const c of String(name || '')) n = (n * 31 + c.charCodeAt(0)) >>> 0;
+  return h('span', { class: `av t${n % AV_TONES}${cls ? ` ${cls}` : ''}` }, initials(name));
+}
 
 function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+
 function lsSet(k, v) {
   try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { /* 저장 불가 환경 */ }
 }
@@ -236,7 +291,8 @@ async function loadDate(date) {
     render();
     return;
   }
-  document.getElementById('app').replaceChildren(h('p', { class: 'muted center' }, `${date} 불러오는 중…`));
+  if (state.ui.rows) state.ui.rows.replaceChildren(h('p', { class: 'empty' }, `${dateLabel(date)} 불러오는 중…`));
+  else document.getElementById('app').replaceChildren(h('p', { class: 'muted center' }, '불러오는 중…'));
   const files = (await listDir(`inbox/${date}`)).filter((f) => f.type === 'file' && f.name.endsWith('.json'));
   const digestFile = files.find((f) => f.name === '_digest.json');
   const mailFiles = files.filter((f) => f.name !== '_digest.json');
@@ -250,6 +306,7 @@ async function loadDate(date) {
   state.digest = digest;
   state.mails = {};
   state.dirty.clear();
+  state.sel = null;
   for (const m of mails) {
     if (!m) continue;
     const id = m.data.id || m.path.split('/').pop().replace(/\.json$/, '');
@@ -260,8 +317,6 @@ async function loadDate(date) {
   if (location.hash.slice(1) !== date) history.replaceState(null, '', `#${date}`);
   render();
 }
-
-// ---------- 화면 ----------
 
 function renderSetup(message) {
   const input = h('input', { type: 'password', class: 'input', placeholder: 'github_pat_…', autocomplete: 'off' });
@@ -285,7 +340,7 @@ function renderSetup(message) {
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
   document.getElementById('app').replaceChildren(
     h('section', { class: 'setup' },
-      h('h1', null, '협업메일'),
+      h('div', { class: 'logo' }, h('span', { class: 'mark' }, icon('send')), '협업메일'),
       h('p', null, 'GitHub 토큰을 한 번만 넣어주세요. 이 브라우저에만 저장돼요.'),
       h('ol', { class: 'steps' },
         h('li', null, link('https://github.com/settings/personal-access-tokens/new', 'Fine-grained 토큰 만들기'), ' 열기'),
@@ -317,17 +372,86 @@ function resetToken() {
   renderSetup();
 }
 
+// ---------- 화면 틀 ----------
+// PC: 사이드바 · 목록 · 상세 3단. 폰: 목록 → 상세 한 장씩 (상세는 ← 로 돌아감).
+
 function render() {
-  const app = document.getElementById('app');
-  app.replaceChildren(topBar(), profileBox(), summary(), cardList());
-  requestAnimationFrame(() => autosize(state.profile.inputs.memo));
+  const ui = state.ui;
+  ui.search = h('input', {
+    type: 'search', class: 'search-input', placeholder: '브랜드·발신인 검색', value: state.query,
+    oninput: (e) => { state.query = e.target.value; renderList(); },
+  });
+  ui.nav = h('nav', { class: 'nav-list' });
+  ui.chips = h('div', { class: 'chips' });
+  ui.rows = h('div', { class: 'rows' });
+  ui.pane = h('section', { class: 'detail' });
+  ui.pfCard = h('button', { type: 'button', class: 'pf-card', onclick: openProfile });
+  ui.pfStrip = h('button', { type: 'button', class: 'status-strip', onclick: openProfile });
+  ui.mbar = mobileBar();
+
+  const dateSelect = h('select', { class: 'date-select', 'aria-label': '날짜', onchange: (e) => go(e.target.value) },
+    state.dates.map((d) => h('option', { value: d, selected: d === state.date }, dateLabel(d))));
+
+  ui.shell = h('div', { class: 'shell' },
+    h('header', { class: 'topbar' },
+      h('button', { type: 'button', class: 'back', onclick: () => closeDetail() }, icon('left'), '목록'),
+      h('div', { class: 'logo' }, h('span', { class: 'mark' }, icon('send')), '협업메일'),
+      h('label', { class: 'search' }, icon('search'), ui.search),
+      h('div', { class: 'top-right' },
+        dateSelect,
+        h('button', { type: 'button', class: 'icon-btn', title: '새로고침', onclick: () => go(state.date) }, icon('refresh')),
+        h('button', { type: 'button', class: 'icon-btn', title: '토큰 다시 넣기', onclick: resetToken }, icon('gear')),
+        h('div', { class: 'me' }, h('span', { class: 'av me-av' }, '정'),
+          h('div', null, h('b', null, '정원'), h('small', null, GMAIL_ACCOUNT))),
+      ),
+    ),
+    h('aside', { class: 'side' },
+      h('button', { type: 'button', class: 'cta', onclick: openProfile }, icon('chart'), '채널 현황'),
+      ui.pfCard,
+      ui.nav,
+      h('h4', null, '날짜'),
+      h('div', { class: 'dates' }, state.dates.map((d) => h('button', {
+        type: 'button', class: `date-row${d === state.date ? ' on' : ''}`, onclick: () => go(d),
+      }, icon('cal'), dateLabel(d)))),
+      digestNotes(),
+    ),
+    h('section', { class: 'list' }, ui.pfStrip, ui.chips, ui.rows),
+    ui.pane,
+    ui.mbar.el,
+  );
+  document.getElementById('app').replaceChildren(ui.shell);
+  renderPfCard();
+  renderList();
+  // PC는 첫 메일을 바로 연다.
+  if (!state.sel && !isNarrow()) {
+    const first = visibleIds()[0];
+    if (first) selectMail(first, { quiet: true });
+  } else if (state.sel) {
+    selectMail(state.sel, { quiet: true });
+  } else {
+    renderDetailPane();
+  }
+}
+
+function dateLabel(d) {
+  return `${Number(d.slice(5, 7))}월 ${Number(d.slice(8, 10))}일`;
+}
+
+function digestNotes() {
+  const notes = state.digest?.notes || [];
+  if (!notes.length) return null;
+  return h('details', { class: 'side-notes' },
+    h('summary', null, `라우틴 메모 ${notes.length}`),
+    h('ul', null, notes.map((n) => h('li', null, n))));
 }
 
 // ---------- 채널 현황 ----------
 // 정원이 적어 두는 최신 정보. 매일 아침 라우틴과 「초안 다시 쓰기」 작업이 읽는다.
 // 모든 칸은 선택이다. 비워 두면 CLAUDE.md의 기준값·기존 규칙대로 쓴다.
+// PC는 사이드바 요약 카드, 폰은 목록 위 한 줄. 누르면 편집 창이 열린다.
 
 const STALE_DAYS = 30;
+
 const METRICS = [
   ['followers', '팔로워', '예: 11.1만'],
   ['views', '조회수', '예: 통상 10,000~100,000회'],
@@ -335,6 +459,7 @@ const METRICS = [
 ];
 
 const today = () => nowKst().slice(0, 10);
+
 const daysSince = (date) => Math.floor((Date.parse(today()) - Date.parse(date)) / 864e5);
 
 async function loadProfile() {
@@ -349,10 +474,11 @@ async function loadProfile() {
   }
   pf.loaded = true;
   if (pf.el) fillProfile();
+  renderPfCard();
   refreshStale();
 }
 
-// 카드는 한 번만 만들어 재사용한다. 날짜를 바꿔도 쓰던 값이 사라지지 않게.
+// 편집 창 내용은 한 번만 만들어 재사용한다. 날짜를 바꿔도 쓰던 값이 사라지지 않게.
 function profileBox() {
   const pf = state.profile;
   if (pf.el) return pf.el;
@@ -371,7 +497,7 @@ function profileBox() {
   f.schedule_note = h('input', { type: 'text', class: 'input', placeholder: '예: 12/1~12/10 불가', disabled: true });
   rows.push(['일정 메모', f.schedule_note, null]);
   f.memo = h('textarea', {
-    class: 'memo-input',
+    class: 'input memo-input',
     rows: '2',
     disabled: true,
     placeholder: '예: 아주 유명한 브랜드면 일정이 빠듯해도 긍정적으로 검토',
@@ -380,29 +506,75 @@ function profileBox() {
   rows.push(['메모', f.memo, null]);
   for (const el of Object.values(f)) el.addEventListener('input', onInput);
 
-  pf.btn = h('button', { type: 'button', class: 'btn small primary', onclick: saveProfile });
+  pf.btn = h('button', { type: 'button', class: 'btn primary', onclick: saveProfile });
   pf.info = h('span', { class: 'muted' });
-  pf.summary = h('span', { class: 'muted' });
-  const det = h('details', { class: 'profile-det', open: lsGet(PROFILE_OPEN_KEY) !== '0' },
-    h('summary', null, h('b', null, '채널 현황'), ' ', pf.summary),
+  pf.summary = h('span');
+  pf.el = h('div', { class: 'pf-edit' },
     h('p', { class: 'muted small' }, '전부 선택이에요. 비워 두면 기존 기준대로 답해요. 매일 아침 판정·초안과 「초안 다시 쓰기」에 반영돼요.'),
     h('div', { class: 'pf-grid' }, rows.map(([label, input, hint]) =>
       h('label', { class: 'pf-row' }, h('span', { class: 'pf-label' }, label), input, hint))),
-    h('div', { class: 'row' }, pf.btn, pf.info));
-  det.addEventListener('toggle', () => {
-    lsSet(PROFILE_OPEN_KEY, det.open ? '1' : '0');
-    if (det.open) autosize(f.memo);
-  });
-  pf.el = h('section', { class: 'memo' }, det);
+    h('div', { class: 'row-end' }, pf.info, pf.btn));
   if (pf.loaded) fillProfile();
   else syncProfile();
   return pf.el;
+}
+
+function openProfile() {
+  const ui = state.ui;
+  if (!ui.modal) {
+    ui.modal = h('div', { class: 'modal-bg', hidden: true, onclick: (e) => { if (e.target === ui.modal) closeProfile(); } },
+      h('div', { class: 'modal', role: 'dialog', 'aria-label': '채널 현황' },
+        h('div', { class: 'modal-head' }, h('h3', null, '채널 현황'),
+          h('button', { type: 'button', class: 'icon-btn', title: '닫기', onclick: closeProfile }, icon('x'))),
+        profileBox()));
+    document.body.append(ui.modal);
+  }
+  ui.modal.hidden = false;
+  requestAnimationFrame(() => autosize(state.profile.inputs.memo));
+}
+
+function closeProfile() {
+  if (state.ui.modal) state.ui.modal.hidden = true;
+}
+
+// 사이드바 카드(PC)와 목록 위 한 줄(폰)
+function renderPfCard() {
+  const { pfCard, pfStrip } = state.ui;
+  if (!pfCard) return;
+  const d = state.profile.data || {};
+  const fol = pfVal(d, 'followers');
+  const folChecked = d.followers?.checked;
+  const from = d.available_from && d.available_from >= today() ? d.available_from : null;
+  const md = (s) => `${Number(s.slice(5, 7))}/${Number(s.slice(8, 10))}`;
+  const stale = folChecked && daysSince(folChecked) > STALE_DAYS;
+
+  const rows = [];
+  if (fol) rows.push(h('div', { class: 'pf' }, h('span', null, '팔로워'), h('b', null, fol),
+    h('small', { class: stale ? 'warn-text' : null }, folChecked ? `${md(folChecked)} 확인${stale ? ' · 오래됨' : ''}` : '')));
+  if (from || d.schedule_note) rows.push(h('div', { class: 'pf' }, h('span', null, '광고 가능'),
+    h('b', null, from ? `${md(from)}~` : '-'), h('small', null, d.schedule_note || '')));
+  if (d.memo) rows.push(h('div', { class: 'pf' }, h('span', null, '메모'), h('small', { class: 'pf-memo' }, d.memo)));
+  if (!state.profile.loaded) rows.push(h('p', { class: 'muted small' }, '불러오는 중…'));
+  else if (!rows.length) rows.push(h('p', { class: 'muted small' }, '비어 있어요 · 기존 기준대로 답해요'));
+  pfCard.replaceChildren(...rows);
+
+  const parts = [
+    fol && h('b', null, `팔로워 ${fol}`),
+    folChecked && fol && `${md(folChecked)} 확인`,
+    from && `광고 가능 ${md(from)}~`,
+    d.schedule_note && '일정 메모',
+    d.memo && '메모',
+  ].filter(Boolean);
+  pfStrip.replaceChildren(icon('chart'),
+    h('span', { class: 'strip-text' }, ...(parts.length ? parts.flatMap((p, i) => (i ? [' · ', p] : [p])) : ['채널 현황 · 비어 있음'])),
+    icon('chev', 'chev'));
 }
 
 const pfVal = (d, key) => (METRICS.some(([k]) => k === key) ? d?.[key]?.value : d?.[key]) || '';
 
 function fillProfile() {
   const pf = state.profile;
+  if (!pf.inputs) return;
   const dirty = profileDirty();
   for (const [key, el] of Object.entries(pf.inputs)) {
     el.disabled = false;
@@ -420,6 +592,8 @@ function profileDirty() {
 
 function syncProfile() {
   const pf = state.profile;
+  renderPfCard();
+  if (!pf.btn) return;
   const dirty = profileDirty();
   const d = pf.data || {};
   pf.btn.disabled = pf.saving || !dirty;
@@ -431,20 +605,11 @@ function syncProfile() {
   for (const [key] of METRICS) {
     const m = d[key];
     const old = m?.value && m.checked ? daysSince(m.checked) : null;
-    pf.hints[key].textContent = old == null ? '' : `${m.checked.slice(5).replace('-', '/')} 확인${old > STALE_DAYS ? ` · ⚠ ${old}일 지남 (기존 규칙대로 다시 확인)` : ''}`;
+    pf.hints[key].textContent = old == null ? '' : `${m.checked.slice(5).replace('-', '/')} 확인${old > STALE_DAYS ? ` · ${old}일 지남 (기존 규칙대로 다시 확인)` : ''}`;
     pf.hints[key].classList.toggle('warn-text', old > STALE_DAYS);
   }
   const from = pf.inputs.available_from.value;
   pf.hints.available_from.textContent = from && from < today() ? '지난 날짜라 무시돼요' : '';
-
-  // 접었을 때 보이는 한 줄 요약
-  const parts = [
-    pfVal(d, 'followers') && `팔로워 ${pfVal(d, 'followers')}`,
-    d.available_from && d.available_from >= today() && `${d.available_from.slice(5).replace('-', '/')}부터 광고 가능`,
-    d.schedule_note && '일정 메모',
-    d.memo && '메모',
-  ].filter(Boolean);
-  pf.summary.textContent = parts.length ? `· ${parts.join(' · ')}` : '· 비어 있음 (기존 기준대로)';
 }
 
 async function saveProfile() {
@@ -495,85 +660,124 @@ function refreshStale() {
   for (const id of Object.keys(state.mails)) renderRegen(id);
 }
 
-function topBar() {
-  const select = h('select', { class: 'select', 'aria-label': '날짜', onchange: (e) => go(e.target.value) },
-    state.dates.map((d) => h('option', { value: d, selected: d === state.date }, d)));
-  const filterBtn = h('button', {
-    type: 'button',
-    class: 'btn small',
-    onclick: () => {
-      state.filter = state.filter === 'todo' ? 'all' : 'todo';
-      lsSet(FILTER_KEY, state.filter);
-      render();
-    },
-  }, state.filter === 'todo' ? '처리 전만' : '전체');
-  return h('header', { class: 'top' },
-    h('h1', null, '협업메일'),
-    select,
-    filterBtn,
-    h('button', { type: 'button', class: 'btn small', title: '새로고침', onclick: () => go(state.date) }, '⟳'),
-    h('button', { type: 'button', class: 'btn small', title: '토큰 다시 넣기', onclick: resetToken }, '⚙'),
-  );
+// ---------- 필터 · 목록 ----------
+
+const FILTERS = [
+  ['todo', '처리 전', 'inbox'],
+  ['urgent', '급함', 'alarm'],
+  ['green', '초록', null],
+  ['yellow', '노랑', null],
+  ['red', '빨강', null],
+  ['followup', '후속', 'reply'],
+  ['duplicate', '중복', 'dup'],
+  ['done', '답장함', 'check'],
+  ['all', '전체', 'list'],
+];
+
+// 답장함·전체가 아니면 처리 전 메일만 본다.
+function matchesFilter(m, f) {
+  const done = isDone(m.status);
+  if (f === 'all') return true;
+  if (f === 'done') return done;
+  if (done) return false;
+  switch (f) {
+    case 'todo': return true;
+    case 'urgent': return !!m.urgent;
+    case 'green': case 'yellow': case 'red': return m.verdict === f;
+    case 'followup': return m.category === 'collab_followup';
+    case 'duplicate': return m.category === 'collab_duplicate';
+    default: return true;
+  }
 }
 
-function summary() {
-  const c = state.digest?.counts;
-  const wrap = h('section', { class: 'summary' });
-  if (c) {
-    const parts = [
-      ['🚨', c.urgent], ['🟢', c.green], ['후속', c.followup], ['🟡', c.yellow],
-      ['🔴', c.red], ['중복', c.duplicate], ['무시', c.ignored],
-    ].filter(([, n]) => n);
-    wrap.append(h('div', { class: 'counts' }, parts.map(([k, n]) => h('span', { class: 'count' }, `${k} ${n}`))));
-  }
-  const notes = state.digest?.notes || [];
-  if (notes.length) {
-    wrap.append(h('details', { class: 'sec' },
-      h('summary', null, `라우틴 메모 ${notes.length}`),
-      h('ul', null, notes.map((n) => h('li', null, n)))));
-  }
-  return wrap;
+function matchesQuery(m) {
+  const q = state.query.trim().toLowerCase();
+  if (!q) return true;
+  return [m.brand?.name, m.from?.name, m.from?.email, m.company?.name, m.subject]
+    .some((x) => x && String(x).toLowerCase().includes(q));
 }
 
-function cardList() {
-  const ids = state.order.filter((id) => {
-    if (state.filter === 'all') return true;
-    const s = state.mails[id].data.status;
-    return s !== 'replied' && s !== 'archived';
+function visibleIds() {
+  return state.order.filter((id) => {
+    const m = state.mails[id].data;
+    return matchesFilter(m, state.filter) && matchesQuery(m);
   });
-  if (!ids.length) {
-    return h('p', { class: 'muted center' }, state.filter === 'todo' ? '처리할 메일이 없어요 🎉' : '메일이 없어요');
-  }
-  return h('div', { class: 'cards' }, ids.map((id) => getCard(id)));
 }
 
-// 카드 DOM은 날짜를 바꿀 때까지 재사용한다. 필터를 바꿔도 쓰던 초안이 사라지지 않게.
-function getCard(id) {
+function setFilter(f) {
+  state.filter = f;
+  lsSet(FILTER_KEY, f);
+  renderList();
+}
+
+function renderNav() {
+  const { nav, chips } = state.ui;
+  if (!nav) return;
+  const all = state.order.map((id) => state.mails[id].data);
+  const count = (f) => all.filter((m) => matchesFilter(m, f)).length;
+  const lead = (f, ic) => (ic ? icon(ic) : dot(f));
+  nav.replaceChildren(...FILTERS.map(([f, label, ic]) => {
+    const n = count(f);
+    return h('button', { type: 'button', class: `nav${state.filter === f ? ' on' : ''}`, onclick: () => setFilter(f) },
+      lead(f, ic), label, n || f === 'todo' ? h('span', { class: 'n' }, n) : null);
+  }));
+  // 폰 칩: 0건인 칸은 숨긴다 (처리 전·답장함은 늘 보임)
+  chips.replaceChildren(...FILTERS.filter(([f]) => f === 'todo' || f === 'done' || f === state.filter || count(f))
+    .map(([f, label, ic]) => {
+      const n = count(f);
+      return h('button', { type: 'button', class: `chip${state.filter === f ? ' on' : ''}`, onclick: () => setFilter(f) },
+        ic ? null : dot(f), label, f === 'done' ? null : h('span', { class: 'n' }, n));
+    }));
+}
+
+function renderList() {
+  renderNav();
+  const ids = visibleIds();
+  const { rows } = state.ui;
+  if (!ids.length) {
+    rows.replaceChildren(h('p', { class: 'empty' },
+      state.query ? '검색 결과가 없어요' : state.filter === 'todo' ? '처리할 메일이 없어요' : '메일이 없어요'));
+    return;
+  }
+  rows.replaceChildren(...ids.map((id) => getRow(id)));
+}
+
+// 목록 행 DOM은 날짜를 바꿀 때까지 재사용한다.
+function getRow(id) {
   const entry = state.mails[id];
   if (entry.el) return entry.el;
-  const m = entry.data;
-  const head = h('button', { type: 'button', class: 'card-head', 'aria-expanded': 'false' });
-  const check = h('input', { type: 'checkbox', class: 'done-check', 'aria-label': '답장 완료', title: '답장 완료' });
-  check.addEventListener('change', () => toggleDone(id, check.checked));
-  const gmail = IS_MOBILE
-    ? h('button', { type: 'button', class: 'gmail', title: 'Gmail 앱에서 답장 쓰기', onclick: () => replyInApp(id) }, '답장 ↗')
-    : h('a', {
-      class: 'gmail',
-      href: gmailUrl(m),
-      target: '_blank',
-      rel: 'noopener noreferrer',
-      title: 'Gmail에서 이 메일 열기',
-    }, '답장 ↗');
-  const card = h('article', { class: cardClass(m), id: `m-${id}` },
-    h('div', { class: 'card-row' }, check, head, gmail));
-  head.addEventListener('click', () => toggleCard(id));
-  entry.el = card;
-  entry.head = head;
-  entry.check = check;
+  const row = h('div', { class: 'row', id: `m-${id}`, role: 'button', tabindex: '0' });
+  row.addEventListener('click', (e) => {
+    if (e.target.closest('.done')) return;
+    selectMail(id);
+  });
+  row.addEventListener('keydown', (e) => { if (e.key === 'Enter') selectMail(id); });
+  entry.check = h('button', { type: 'button', class: 'done', title: '답장 완료', 'aria-label': '답장 완료' }, icon('tick'));
+  entry.check.addEventListener('click', () => toggleDone(id, !isDone(curStatus(entry))));
+  entry.el = row;
   fillHead(id);
-  syncCheck(id);
-  return card;
+  return row;
 }
+
+function snippet(id, m) {
+  let s = state.digest?.lines?.[id] || '';
+  s = s.replace(/^[^\p{L}\p{N}]+/u, '').replace(/^(후속|중복)\s+/, '');
+  const b = m.brand?.name;
+  if (b && s.startsWith(b)) s = s.slice(b.length).replace(/^\([^)]*\)/, '');
+  s = s.replace(/^\s*[·:,-]?\s*/, '').replace(/[,·]?\s*(한국어 |영문 )?초안 있음$/, '').trim();
+  return s || m.subject || '';
+}
+
+function draftTag(m) {
+  const ds = m.drafts || [];
+  if (!ds.length) return null;
+  const kinds = new Set(ds.map((d) => d.kind));
+  if (kinds.has('followup')) return '후속 초안';
+  if (kinds.has('positive') && kinds.has('decline')) return '초안 수락·거절';
+  return new Set(ds.map((d) => d.lang)).size > 1 ? '초안 KO·EN' : '초안';
+}
+
+const md = (iso) => (iso ? `${iso.slice(5, 7)}/${iso.slice(8, 10)}` : '');
 
 function gmailUrl(m) {
   return `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(GMAIL_ACCOUNT)}#all/${m.thread_id || m.id}`;
@@ -585,7 +789,8 @@ function composeUrl(to, subject, body) {
   const q = (o) => Object.entries(o).filter(([, v]) => v).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
   if (IS_IOS) return `googlegmail:///co?${q({ to, subject, body })}`;
   if (IS_ANDROID) return `intent:${encodeURIComponent(to || '')}?${q({ subject, body })}#Intent;scheme=mailto;package=com.google.android.gm;end`;
-  return null;
+  // PC: 회사 계정 Gmail 웹 작성 창
+  return `https://mail.google.com/mail/?authuser=${encodeURIComponent(GMAIL_ACCOUNT)}&view=cm&fs=1&${q({ to, su: subject, body })}`;
 }
 
 // 받은 날 앞뒤 하루로 좁힌 검색어. 시간대 차이로 빠지지 않게 하루씩 여유를 둔다.
@@ -632,7 +837,9 @@ function openCompose(id, i) {
   const body = i >= 0 ? (entry.draftInputs?.[i]?.value ?? dr.body ?? '') : '';
   const n = (body.match(/\[확인필요/g) || []).length;
   if (n && !confirm(`[확인필요] ${n}곳이 남아 있어요. 그래도 Gmail 앱을 열까요?`)) return;
-  location.href = composeUrl(m.from?.email, replySubject(m, dr), body);
+  const url = composeUrl(m.from?.email, replySubject(m, dr), body);
+  if (IS_MOBILE) location.href = url;
+  else window.open(url, '_blank', 'noopener');
 }
 
 // 카드의 「답장」 버튼 (폰). 초안이 한 종류면 바로 작성 화면, 수락·거절처럼 여러 종류면 초안 탭으로 보낸다.
@@ -641,33 +848,38 @@ function replyInApp(id) {
   const kinds = new Set((entry.data.drafts || []).map((dr) => dr.kind));
   if (kinds.size > 1) {
     openCard(id);
-    entry.detail.querySelector('.drafts')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    toast('보낼 초안 탭에서 「Gmail 앱으로」를 눌러 주세요');
+    entry.detail?.querySelector('.drafts')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    toast('보낼 초안 탭을 고른 뒤 「Gmail 앱」을 눌러 주세요');
     return;
   }
   openCompose(id, sendIndex(entry.data));
 }
 
 const isDone = (status) => status === 'replied' || status === 'archived';
+const curStatus = (entry) => entry.pending.status || entry.data.status;
 
 function syncCheck(id) {
   const entry = state.mails[id];
-  if (!entry.check) return;
-  // 저장 중엔 누른 상태를 그대로 둔다. (pending은 저장 시작 때 비워짐)
-  if (!entry.saving) entry.check.checked = isDone(entry.pending.status || entry.data.status);
-  entry.check.disabled = entry.saving;
+  const done = isDone(curStatus(entry));
+  for (const b of [entry.check, entry.dDone]) {
+    if (!b) continue;
+    b.classList.toggle('is-done', done);
+    b.disabled = entry.saving;
+    b.title = done ? '처리 전으로 되돌리기' : '답장 완료';
+  }
+  if (state.sel === id) syncMobileBar();
 }
 
-// 체크하면 답장함으로 바꾸고, 처리 전만 보기에서는 목록에서 뺀다. 되돌리기는 이전 상태로.
+// 체크하면 답장함으로 바꾸고, 처리 전 보기에서는 목록에서 뺀다. 되돌리기는 이전 상태로.
 async function toggleDone(id, done) {
   const entry = state.mails[id];
-  const before = entry.pending.status || entry.data.status;
+  if (entry.saving) return;
+  const before = curStatus(entry);
   entry.pending.status = done ? 'replied' : (isDone(entry.undoStatus) ? 'new' : entry.undoStatus || 'new');
   if (done) entry.undoStatus = before;
-  entry.el.classList.toggle('done', done);
+  entry.el?.classList.toggle('is-done', done);
   const ok = await save(id, { quiet: true });
   if (!ok) {
-    // 체크는 실패하면 그냥 원래대로. (저장 안 됨 상태로 남기지 않는다)
     entry.pending.status = null;
     if (!hasPending(entry.pending)) state.dirty.delete(id);
     fillHead(id);
@@ -677,79 +889,173 @@ async function toggleDone(id, done) {
   }
   if (!done) {
     toast('처리 전으로 돌렸어요');
+    renderList();
     return;
   }
-  const undo = { label: '되돌리기', fn: () => toggleDone(id, false).then(() => render()) };
-  if (state.filter !== 'todo') {
+  const undo = { label: '되돌리기', fn: () => toggleDone(id, false) };
+  if (matchesFilter(entry.data, state.filter)) {
+    renderNav();
     toast('답장 완료로 표시했어요', false, undo);
     return;
   }
-  entry.el.classList.add('leaving');
+  entry.el?.classList.add('leaving');
   setTimeout(() => {
-    entry.el.classList.remove('leaving');
-    render();
+    entry.el?.classList.remove('leaving');
+    renderList();
   }, 250);
   toast('답장 완료 · 목록에서 뺐어요', false, undo);
 }
 
-function cardClass(m) {
-  const cls = ['card'];
-  if (m.urgent) cls.push('urgent');
-  if (m.verdict) cls.push(`v-${m.verdict}`);
+function rowClass(id) {
+  const m = state.mails[id].data;
+  const cls = ['row'];
+  if (state.sel === id) cls.push('on');
   if (m.category === 'collab_duplicate') cls.push('dim');
-  if (isDone(m.status)) cls.push('done');
+  if (isDone(m.status)) cls.push('is-done');
   return cls.join(' ');
 }
 
 function fillHead(id) {
   const entry = state.mails[id];
   const m = entry.data;
-  const line = state.digest?.lines?.[id] ||
-    `${m.urgent ? '🚨' : ''}${VERDICT[m.verdict] || ''} ${m.brand?.name || m.subject || id}`;
-  const draftCount = new Set((m.drafts || []).map((d) => d.kind)).size;
-  entry.head.replaceChildren(
-    h('div', { class: 'line' }, STATUS_ICON[m.status] ? `${STATUS_ICON[m.status]} ` : '', line),
-    h('div', { class: 'sub' },
-      h('span', null, `${m.from?.name || m.from?.email || ''} · ${fmtTime(m.received_at)}`),
-      m.from_spam ? h('span', { class: 'chip warn' }, '스팸함') : null,
-      draftCount ? h('span', { class: 'chip' }, draftCount > 1 ? `초안 ${draftCount}종` : '초안') : null,
-      (m.drafts || []).some((d) => d.edited) ? h('span', { class: 'chip' }, '수정함') : null,
-      m.translate_request && !m.translate_request.error ? h('span', { class: 'chip' }, '번역 중') : null,
-      m.regenerate_request && !m.regenerate_request.error ? h('span', { class: 'chip' }, '다시 쓰는 중') : null,
-      m.research_request && !m.research_request.error ? h('span', { class: 'chip' }, '조사 중') : null,
-      state.dirty.has(id) ? h('span', { class: 'chip warn' }, '저장 안 됨') : null,
-    ),
+  if (!entry.el) return;
+  const title = m.brand?.name || m.from?.name || m.subject || id;
+  const lead = m.category === 'collab_followup' ? icon('reply', 'lead')
+    : m.category === 'collab_duplicate' ? icon('dup', 'lead')
+      : m.verdict ? dot(m.verdict) : null;
+  const ask = m.analysis?.needs_user_input?.length || 0;
+  const deadline = m.deadline?.date;
+  const tags = [
+    m.urgent || deadline ? h('span', { class: 'tag urgent' }, icon('alarm'), deadline ? `${md(deadline)}까지` : '급함') : null,
+    m.category === 'personal' ? h('span', { class: 'tag' }, '개인 메일') : null,
+    draftTag(m) ? h('span', { class: 'tag' }, draftTag(m)) : null,
+    ask ? h('span', { class: 'tag ask' }, `확인필요 ${ask}`) : null,
+    m.from_spam ? h('span', { class: 'tag' }, '스팸함') : null,
+    (m.drafts || []).some((d) => d.edited) ? h('span', { class: 'tag' }, '수정함') : null,
+    m.translate_request && !m.translate_request.error ? h('span', { class: 'tag busy' }, '번역 중') : null,
+    m.regenerate_request && !m.regenerate_request.error ? h('span', { class: 'tag busy' }, '다시 쓰는 중') : null,
+    m.research_request && !m.research_request.error ? h('span', { class: 'tag busy' }, '조사 중') : null,
+    state.dirty.has(id) ? h('span', { class: 'tag ask' }, '저장 안 됨') : null,
+  ].filter(Boolean);
+
+  entry.el.className = rowClass(id);
+  entry.el.replaceChildren(
+    avatar(title),
+    h('div', { class: 't' }, lead, h('span', { class: 'name' }, title)),
+    h('span', { class: 'time' }, md(m.received_at)),
+    h('div', { class: 'who' },
+      m.from?.name || m.from?.email ? [icon('user'), h('span', null, m.from?.name || m.from?.email)] : null,
+      m.company?.name ? [h('span', { class: 'sep' }, '·'), icon('bldg'), h('span', null, m.company.name)] : null),
+    h('div', { class: 'snip' }, snippet(id, m)),
+    h('div', { class: 'tags' }, tags),
+    entry.check,
   );
+  syncCheck(id);
 }
 
-function toggleCard(id) {
+// ---------- 상세 ----------
+
+function selectMail(id, { quiet = false } = {}) {
+  const prev = state.sel;
+  state.sel = id;
+  if (prev && prev !== id && state.mails[prev]?.el) state.mails[prev].el.className = rowClass(prev);
   const entry = state.mails[id];
-  if (!entry.detail) {
-    entry.detail = buildDetail(id);
-    entry.el.append(entry.detail);
-  } else {
-    entry.detail.hidden = !entry.detail.hidden;
+  if (!entry) return;
+  if (entry.el) entry.el.className = rowClass(id);
+  renderDetailPane();
+  if (isNarrow() && !quiet) {
+    if (!state.ui.shell.classList.contains('show-detail')) history.pushState({ detail: id }, '', location.hash);
+    state.ui.shell.classList.add('show-detail');
+    window.scrollTo(0, 0);
   }
-  const open = !entry.detail.hidden;
-  entry.head.setAttribute('aria-expanded', String(open));
-  entry.el.classList.toggle('open', open);
-  if (open) requestAnimationFrame(() => entry.detail.querySelectorAll('textarea.draft').forEach(autosize));
+  state.ui.pane.scrollTop = 0;
+}
+
+function closeDetail(fromPop) {
+  if (!state.ui.shell?.classList.contains('show-detail')) return;
+  state.ui.shell.classList.remove('show-detail');
+  if (!fromPop && history.state?.detail) history.back();
+  const el = state.sel && state.mails[state.sel]?.el;
+  if (el) requestAnimationFrame(() => el.scrollIntoView({ block: 'center' }));
+}
+
+function renderDetailPane() {
+  const { pane } = state.ui;
+  const entry = state.sel && state.mails[state.sel];
+  if (!entry) {
+    pane.replaceChildren(h('div', { class: 'pane-empty' }, icon('inbox'), h('p', null, '메일을 골라 주세요')));
+    syncMobileBar();
+    return;
+  }
+  if (!entry.detail) entry.detail = buildDetail(state.sel);
+  pane.replaceChildren(entry.detail);
+  syncFolds();
+  syncMobileBar();
+  requestAnimationFrame(() => entry.detail.querySelectorAll('textarea.draft').forEach(autosize));
 }
 
 function openCard(id) {
-  const entry = state.mails[id];
-  if (!entry) return false;
-  if (!entry.el.isConnected) {
-    state.filter = 'all';
-    render();
-  }
-  if (!entry.detail || entry.detail.hidden) toggleCard(id);
-  entry.el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (!state.mails[id]) return false;
+  if (!visibleIds().includes(id)) setFilter('all');
+  selectMail(id);
+  state.mails[id].el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   return true;
 }
 
+// PC는 메일 내용을 펼쳐 두고, 폰은 접어 둔다.
+function syncFolds() {
+  const entry = state.sel && state.mails[state.sel];
+  const fold = entry?.detail?.querySelector('details.mailfold');
+  if (fold && !fold.dataset.touched) fold.open = !isNarrow();
+}
+MQ.addEventListener('change', () => {
+  syncFolds();
+  if (!isNarrow()) state.ui.shell?.classList.remove('show-detail');
+});
+
+// ---------- 폰 하단 바 ----------
+
+function mobileBar() {
+  const bar = {};
+  bar.copy = h('button', { type: 'button', class: 'btn primary' }, icon('copy'), '본문 복사');
+  bar.gmail = h('button', { type: 'button', class: 'btn' }, icon('send'), 'Gmail 앱');
+  bar.done = h('button', { type: 'button', class: 'btn sq', title: '답장 완료' }, icon('tick'));
+  bar.copy.addEventListener('click', () => {
+    const entry = state.mails[state.sel];
+    const ta = entry?.draftInputs?.[entry.tab];
+    if (ta) copyText(ta.value);
+  });
+  bar.gmail.addEventListener('click', () => {
+    const entry = state.mails[state.sel];
+    if (!entry) return;
+    const m = entry.data;
+    const review = m.lang !== 'ko' && m.drafts?.[entry.tab]?.lang === 'ko';
+    const i = review ? m.drafts.findIndex((d) => d.kind === m.drafts[entry.tab].kind && d.lang === 'en') : entry.tab;
+    openCompose(state.sel, i ?? sendIndex(m));
+  });
+  bar.done.addEventListener('click', () => {
+    const entry = state.mails[state.sel];
+    if (entry) toggleDone(state.sel, !isDone(curStatus(entry)));
+  });
+  bar.el = h('div', { class: 'mbar' }, bar.copy, bar.gmail, bar.done);
+  state.ui.bar = bar;
+  return bar;
+}
+
+function syncMobileBar() {
+  const bar = state.ui.bar;
+  if (!bar) return;
+  const entry = state.sel && state.mails[state.sel];
+  const hasDraft = !!entry?.data.drafts?.length;
+  bar.copy.disabled = !hasDraft;
+  bar.gmail.disabled = !entry;
+  const done = entry ? isDone(curStatus(entry)) : false;
+  bar.done.classList.toggle('is-done', done);
+  bar.done.disabled = !entry || entry.saving;
+}
+
 function section(title, content, { open = false, cls = '' } = {}) {
-  return h('details', { class: `sec ${cls}`, open }, h('summary', null, title), content);
+  return h('details', { class: `sec ${cls}`, open }, h('summary', null, title, icon('chev', 'chev')), content);
 }
 
 function list(items, ordered) {
@@ -767,92 +1073,110 @@ function kv(rows) {
 }
 
 function buildDetail(id) {
-  const m = state.mails[id].data;
+  const entry = state.mails[id];
+  const m = entry.data;
   const a = m.analysis || {};
-  const d = h('div', { class: 'detail' });
+  const lang = m.lang && m.lang !== 'ko' ? 'en' : null;
 
-  d.append(h('div', { class: 'meta' },
-    h('div', null, h('b', null, m.from?.name || ''), ' ', h('span', { class: 'muted' }, m.from?.email || ''),
-      ' · ', IS_IOS
-        ? h('button', { type: 'button', class: 'linkish', onclick: () => openInGmailApp(m) }, 'Gmail에서 열기')
-        : link(gmailUrl(m), 'Gmail에서 열기')),
-    h('div', null, m.subject || ''),
-    h('div', { class: 'muted' }, `받음 ${fmtTime(m.received_at)}`,
-      m.company?.name ? ` · ${m.company.name}` : '',
-      m.company?.type ? ` (${COMPANY_TYPE[m.company.type] || m.company.type})` : ''),
-  ));
+  entry.dDone = h('button', { type: 'button', class: 'icon-btn done-btn', title: '답장 완료' }, icon('tick'));
+  entry.dDone.addEventListener('click', () => toggleDone(id, !isDone(curStatus(entry))));
+  const gmail = IS_IOS
+    ? h('button', { type: 'button', class: 'icon-btn', title: 'Gmail 앱 열기 (검색어 복사)', onclick: () => openInGmailApp(m) }, icon('ext'))
+    : h('a', { class: 'icon-btn', href: gmailUrl(m), target: '_blank', rel: 'noopener noreferrer', title: 'Gmail에서 열기' }, icon('ext'));
 
+  const head = h('div', { class: 'd-head' },
+    avatar(m.from?.name || m.from?.email),
+    h('div', { class: 'd-from' },
+      h('b', null, m.from?.name || m.from?.email || ''),
+      h('small', null, [m.from?.email, m.company?.name].filter(Boolean).join(' · ')),
+      h('small', { class: 'd-time' }, fmtTime(m.received_at))),
+    h('span', { class: 'time' }, fmtTime(m.received_at)),
+    h('div', { class: 'acts' }, gmail, entry.dDone));
+
+  const badges = h('div', { class: 'badges' },
+    m.verdict ? h('span', { class: `pill v-${m.verdict}` }, dot(m.verdict), VERDICT_LABEL[m.verdict]) : null,
+    CATEGORY_LABEL[m.category] ? h('span', { class: 'pill' }, CATEGORY_LABEL[m.category]) : null,
+    a.collab_type ? h('span', { class: 'pill plain' },
+      `${COLLAB[a.collab_type] || a.collab_type}${a.content_count ? ` · ${a.content_count}편` : ''}`) : null,
+    a.schedule ? h('span', { class: 'pill plain' }, a.schedule) : null,
+    m.company?.type ? h('span', { class: 'pill plain' }, COMPANY_TYPE[m.company.type] || m.company.type) : null);
+
+  const alerts = [];
   if (m.deadline) {
-    d.append(h('div', { class: 'alert' }, `회신 기한 ${m.deadline.date}`,
-      m.deadline.quote ? h('div', { class: 'quote' }, `“${m.deadline.quote}”`) : null));
+    alerts.push(h('div', { class: 'alert' }, icon('alarm'), h('div', null, h('b', null, `회신 기한 ${m.deadline.date}`),
+      m.deadline.quote ? h('div', { class: 'quote', lang }, `“${m.deadline.quote}”`) : null)));
   }
-  if (m.from_spam) d.append(h('div', { class: 'alert' }, '스팸함에서 찾은 메일이에요'));
+  if (m.from_spam) alerts.push(h('div', { class: 'alert' }, '스팸함에서 찾은 메일이에요'));
   if (m.duplicate_of) {
-    d.append(h('div', { class: 'note' }, '이전 메일과 같은 제안: ',
+    alerts.push(h('div', { class: 'note' }, '이전 메일과 같은 제안: ',
       state.mails[m.duplicate_of]
         ? h('button', { type: 'button', class: 'linkish', onclick: () => openCard(m.duplicate_of) },
-          state.digest?.lines?.[m.duplicate_of] || m.duplicate_of)
+          state.mails[m.duplicate_of].data.brand?.name || m.duplicate_of)
         : m.duplicate_of));
   }
-  if (m.changes_from_previous) d.append(h('div', { class: 'note' }, `이전과 달라진 점: ${m.changes_from_previous}`));
+  if (m.changes_from_previous) alerts.push(h('div', { class: 'note' }, `이전과 달라진 점: ${m.changes_from_previous}`));
 
-  if (a.needs_user_input?.length) d.append(section('정원 확인 필요', list(a.needs_user_input), { open: true, cls: 'ask' }));
+  const ask = a.needs_user_input?.length
+    ? h('div', { class: 'askbox' }, h('h3', null, '정원이 정해야 할 것'),
+      h('ol', null, a.needs_user_input.map((x, i) => h('li', null, h('i', null, i + 1), h('span', null, txt(x))))))
+    : null;
 
-  d.append(section('메일 내용 및 분석', h('div', null,
-    h('p', { class: 'label' }, '메일 내용'),
-    h('div', { class: 'body mailbody' }, m.body || '(내용 없음)'),
-    a.questions?.length ? h('div', null, h('p', { class: 'label' }, '상대 질문'), list(a.questions, true)) : null,
+  // 메일 내용 및 분석: PC는 펼쳐 두고 제목줄을 숨긴다. 폰은 접힌 채 시작.
+  const fold = h('details', { class: 'mailfold' },
+    h('summary', null, '메일 내용 및 분석', icon('chev', 'chev')),
+    h('div', { class: 'mail-body', lang }, m.body || '(내용 없음)'),
+    a.questions?.length ? h('div', { class: 'block' }, h('h3', null, '상대 질문'), list(a.questions, true)) : null,
     kv([
-      ['형태', a.collab_type ? `${COLLAB[a.collab_type] || a.collab_type}${a.content_count ? ` · ${a.content_count}편` : ''}` : null],
-      ['일정', a.schedule],
       ['할인 요청', a.discount_request ? '있음' : null],
       ['2차 활용', a.secondary_use ? '언급 있음' : null],
       ['자동DM 질문', a.auto_dm_question ? '있음' : null],
     ]),
-    a.risks?.length ? h('div', null, h('p', { class: 'label' }, '유의점'), list(a.risks)) : null,
-  )));
+    a.risks?.length ? h('div', { class: 'block' }, h('h3', null, '유의점'), list(a.risks)) : null);
+  fold.addEventListener('toggle', () => { if (isNarrow()) fold.dataset.touched = '1'; });
 
-  const research = researchSection(id);
-  if (research) d.append(research);
+  const main = h('div', { class: 'd-main' },
+    h('h2', { lang }, m.subject || '(제목 없음)'),
+    badges, ...alerts, ask, fold);
+
+  const d = h('div', { class: 'd-wrap' }, head, h('div', { class: 'd-grid' }, main, researchSection(id)));
   if (m.research_request && !m.research_request.error) watchResearch(id);
   if (m.drafts?.length) d.append(draftsView(id));
-  d.append(feedbackView(id));
-  d.append(actionsView(id));
+  d.append(actionsView(id), feedbackView(id));
   return d;
 }
 
+// 조사 결과: 판정 근거 → 서비스·발신 회사(각각 접었다 펴는 칸) → 더 조사
 function researchSection(id) {
   const entry = state.mails[id];
   const m = entry.data;
   const hasDb = !!(m.brand?.service_id || m.company?.company_id);
   const reasons = m.verdict_reasons?.length
-    ? h('div', null, h('p', { class: 'label' }, `판정 근거${m.verdict ? ` ${VERDICT[m.verdict]}` : ''}`), list(m.verdict_reasons))
+    ? h('div', { class: 'reasons' }, h('h4', null, '판정 근거'), list(m.verdict_reasons))
     : null;
-  if (!hasDb) return reasons ? section('조사 결과', reasons) : null;
-  const views = h('div', null, h('p', { class: 'muted' }, '불러오는 중…'));
+  if (!hasDb && !reasons) return h('aside', { class: 'rail' });
+  const views = h('div', { class: 'ents' }, hasDb ? h('p', { class: 'muted small' }, '불러오는 중…') : null);
   const btn = h('button', {
     type: 'button',
-    class: 'btn small',
+    class: 'btn sm ghost',
     title: '못 찾은 항목 위주로 조금 더 찾아요 (Sonnet, 검색 10회 이내)',
     onclick: () => startResearch(id),
-  }, '더 조사');
+  }, icon('search'), '더 조사');
   entry.rs = {
     views,
     btn,
     status: h('p', { class: 'tr-status', hidden: true }),
     note: h('div', { class: 'note', hidden: true }),
   };
-  const det = section('조사 결과', h('div', { class: 'research' },
+  const rail = h('aside', { class: 'rail' },
+    h('h3', null, '조사 결과'),
     reasons,
     entry.rs.note,
     views,
-    h('div', { class: 'row' }, btn),
-    entry.rs.status));
-  det.addEventListener('toggle', () => {
-    if (det.open && !views.dataset.done) fillResearch(id);
-  });
+    hasDb ? h('div', { class: 'rail-foot' }, btn) : null,
+    entry.rs.status);
+  if (hasDb) fillResearch(id);
   renderResearch(id);
-  return det;
+  return rail;
 }
 
 async function fillResearch(id) {
@@ -866,9 +1190,8 @@ async function fillResearch(id) {
       sid ? serviceView(db.services[sid], sid) : null,
       cid ? companyView(db.companies[cid], cid) : null,
     ].filter(Boolean));
-    views.dataset.done = '1';
   } catch (e) {
-    views.replaceChildren(h('p', { class: 'err' }, `조사 DB를 못 불러왔어요: ${errMsg(e)}`));
+    views.replaceChildren(h('p', { class: 'err small' }, `조사 DB를 못 불러왔어요: ${errMsg(e)}`));
   }
 }
 
@@ -879,6 +1202,7 @@ function sources(list_) {
 
 // 로그인해야 보이는 곳은 자동 조사에서 빼고 직접 확인 링크로 대신한다.
 const LOGIN_WALLED = /linkedin|glassdoor|indeed|잡플래닛|jobplanet|블라인드|blind|크레딧잡|채용\s*(사이트\s*)?평/i;
+
 const stillMissing = (list_) => (list_ || []).filter((x) => !LOGIN_WALLED.test(String(x)));
 
 function domainText(dm) {
@@ -902,16 +1226,24 @@ function manualChecks(name) {
 }
 
 // 서비스·발신 회사는 각각 접었다 펴는 칸. 처음엔 접혀 있다.
-function dbToggle(title, content) {
-  return h('details', { class: 'db' }, h('summary', null, title.trim()), content);
+function dbToggle(name, sub, hint, content) {
+  return h('details', { class: 'ent' },
+    h('summary', null,
+      h('span', { class: 'ent-av' }, avatar(name), hint ? dot(hint) : null),
+      h('div', { class: 'ent-text' }, h('b', null, name), h('small', null, sub)),
+      icon('chev', 'chev')),
+    h('div', { class: 'ent-body' }, content));
 }
 
 function serviceView(s, sid) {
-  if (!s) return dbToggle(`서비스 · ${sid}`, h('p', { class: 'muted' }, '조사 기록 없음'));
+  if (!s) return dbToggle(sid, '서비스 · 조사 기록 없음', null, h('p', { class: 'muted small' }, '조사 기록 없음'));
   const op = s.operator || {};
   const pa = s.parent || {};
   const rep = s.reputation || {};
-  return dbToggle(`서비스 · ${s.name || sid} ${VERDICT[s.verdict_hint] || ''}`,
+  const short = (x) => String(x || '').replace(/\s*\(.*?\)\s*/g, ' ').trim();
+  const sub = ['서비스', short(pa.name) || short(op.legal_name).split(/[.,]/)[0], s.china_linked ? `중국계 ${s.china_linked}` : null]
+    .filter(Boolean).join(' · ');
+  return dbToggle(s.name || sid, sub, s.verdict_hint,
     kv([
       ['운영사', [op.legal_name || '법인명 미확인', op.country].filter(Boolean).join(' · ')],
       ['모회사', pa.name ? `${pa.name}${pa.country ? ` · ${pa.country}` : ''}${pa.confidence ? ` (${pa.confidence})` : ''}` : null],
@@ -925,14 +1257,15 @@ function serviceView(s, sid) {
       ['미확인', stillMissing(s.missing)],
       ['조사일', s.researched_at],
       ['출처', sources(s.sources)],
-    ]),
-  );
+    ]));
 }
 
 function companyView(c, cid) {
-  if (!c) return dbToggle(`발신 회사 · ${cid}`, h('p', { class: 'muted' }, '조사 기록 없음'));
+  if (!c) return dbToggle(cid, '발신 회사 · 조사 기록 없음', null, h('p', { class: 'muted small' }, '조사 기록 없음'));
   const rv = c.reviews || {};
-  return dbToggle(`발신 회사 · ${c.name || cid} ${VERDICT[c.verdict_hint] || ''}`,
+  const sub = ['발신 회사', COMPANY_TYPE[c.type] && c.type !== 'unknown' ? COMPANY_TYPE[c.type] : null, c.country]
+    .filter(Boolean).join(' · ');
+  return dbToggle(c.name || cid, sub, c.verdict_hint,
     kv([
       ['유형', COMPANY_TYPE[c.type] || c.type],
       ['국가', c.country],
@@ -948,8 +1281,7 @@ function companyView(c, cid) {
       ['조사일', c.researched_at],
       ['출처', sources(c.sources)],
       ['직접 확인', manualChecks(c.name || cid)],
-    ]),
-  );
+    ]));
 }
 
 function draftsView(id) {
@@ -976,9 +1308,9 @@ function draftsView(id) {
     const review = m.lang !== 'ko' && dr.lang === 'ko';
     const paired = m.lang !== 'ko' && m.drafts.some((x) => x.kind === dr.kind && x.lang === (dr.lang === 'ko' ? 'en' : 'ko'));
     tabEls.push(h('button', { type: 'button', class: 'tab', role: 'tab', onclick: () => select(i) },
-      `${KIND[dr.kind] || dr.kind} · ${(dr.lang || '').toUpperCase()}`, review ? ' (검토용)' : '', dr.edited ? ' ✎' : ''));
+      dr.kind === 'default' ? '' : `${KIND[dr.kind] || dr.kind} · `, (dr.lang || '').toUpperCase(), review ? ' 검토용' : '', dr.edited ? ' · 수정함' : ''));
 
-    const ta = h('textarea', { class: 'draft', spellcheck: 'false', value: dr.body || '' });
+    const ta = h('textarea', { class: 'draft', spellcheck: 'false', lang: dr.lang === 'en' ? 'en' : null, value: dr.body || '' });
     const warn = h('p', { class: 'warn-text' });
     const updateWarn = () => {
       const n = (ta.value.match(/\[확인필요/g) || []).length;
@@ -1004,22 +1336,23 @@ function draftsView(id) {
         class: 'btn',
         title: '이 국문본 기준으로 영문 초안을 다시 써요 (1~2분)',
         onclick: () => startTranslation(id, i),
-      }, '영문에 반영')
+      }, icon('globe'), '영문에 반영')
       : null;
 
     panelEls.push(h('div', { class: 'panel', role: 'tabpanel' },
       dr.subject ? h('div', { class: 'subject' },
-        h('span', { class: 'muted' }, '제목 '), h('span', null, dr.subject),
-        h('button', { type: 'button', class: 'btn small', onclick: () => copyText(dr.subject) }, '제목 복사')) : null,
+        h('span', { class: 'subj-label' }, '제목'), h('span', { class: 'subj-text', lang: dr.lang === 'en' ? 'en' : null }, dr.subject),
+        h('button', { type: 'button', class: 'btn sm ghost', onclick: () => copyText(dr.subject) }, icon('copy'), '제목 복사')) : null,
       ta,
       warn,
-      h('div', { class: 'row' },
-        h('button', { type: 'button', class: 'btn primary', onclick: () => copyText(ta.value) }, '본문 복사'),
-        IS_MOBILE && !review
-          ? h('button', { type: 'button', class: 'btn', title: '제목·받는 사람·본문을 채운 Gmail 앱 작성 화면을 열어요', onclick: () => openCompose(id, i) }, 'Gmail 앱으로')
-          : null,
+      h('div', { class: 'd-acts' },
+        h('button', { type: 'button', class: 'btn primary pc-only', onclick: () => copyText(ta.value) }, icon('copy'), '본문 복사'),
+        review ? null : h('button', {
+          type: 'button', class: 'btn pc-only', title: '받는 사람·제목·본문을 채운 Gmail 작성 창을 열어요', onclick: () => openCompose(id, i),
+        }, icon('send'), 'Gmail로 쓰기'),
         trBtn,
-        review ? h('span', { class: 'muted' }, '보낼 땐 EN 탭 본문을 복사하세요') : null),
+        review ? h('span', { class: 'muted small' }, '보낼 땐 EN 탭 본문을 복사하세요') : null,
+        h('button', { type: 'button', class: 'btn ghost push-right', onclick: () => toggleRegen(id) }, icon('wand'), '초안 다시 쓰기')),
       trStatus,
     ));
   });
@@ -1036,7 +1369,7 @@ function draftsView(id) {
   const regen = regenBox(id);
   renderRegen(id);
   if (m.regenerate_request && !m.regenerate_request.error) watchRegenerate(id);
-  return h('section', { class: 'drafts' }, h('h3', null, '답장 초안'), tabs, panels, regen);
+  return h('section', { class: 'drafts' }, h('div', { class: 'd-top' }, h('h3', null, '답장 초안'), tabs), panels, regen);
 }
 
 // ---------- 초안 다시 쓰기 ----------
@@ -1048,21 +1381,29 @@ function regenBox(id) {
     stale: h('p', { class: 'tr-status err', hidden: true }),
     label: h('p', { class: 'label' }),
     input: h('textarea', {
-      class: 'note-input',
+      class: 'input note-input',
       rows: '2',
       placeholder: '예: 광고 일정이 꽉 차서 죄송하지만 이번엔 어렵다는 내용으로 바꿔줘',
     }),
-    btn: h('button', { type: 'button', class: 'btn', onclick: () => startRegenerate(id) }, '초안 다시 쓰기'),
+    btn: h('button', { type: 'button', class: 'btn dark', onclick: () => startRegenerate(id) }, '다시 쓰기'),
     undo: h('button', {
       type: 'button',
-      class: 'btn small',
+      class: 'btn ghost',
       title: '다시 쓰기 전 초안과 바꿔요. 한 번 더 누르면 다시 돌아와요',
       onclick: () => swapPrevious(id),
     }, '↶ 이전 초안으로'),
     status: h('p', { class: 'tr-status', hidden: true }),
   };
   const { stale, label, input, btn, undo, status } = entry.rg;
-  return h('div', { class: 'regen' }, stale, label, input, h('div', { class: 'row' }, btn, undo), status);
+  entry.rg.box = h('div', { class: 'regen', hidden: true }, label, input, h('div', { class: 'd-acts' }, btn, undo));
+  return h('div', null, stale, entry.rg.box, status);
+}
+
+// 「초안 다시 쓰기」 버튼은 요청 칸을 열고 닫기만 한다.
+function toggleRegen(id) {
+  const rg = state.mails[id].rg;
+  rg.box.hidden = !rg.box.hidden;
+  if (!rg.box.hidden) rg.input.focus();
 }
 
 const tabKind = (entry) => entry.data.drafts?.[entry.tab]?.kind;
@@ -1080,7 +1421,7 @@ function renderRegen(id) {
   stale.textContent = stale.hidden ? '' : `채널 현황이 이 초안 뒤에 바뀌었어요 (${fmtTime(changed)}). 보낼 거면 「초안 다시 쓰기」로 맞춰 주세요`;
   label.textContent = `수정 요청 · ${KIND[kind] || kind} 초안${same.length > 1 ? ' (KO·EN 같이 다시 써요)' : ''}`;
   btn.disabled = !!(entry.regenerating || entry.saving);
-  btn.textContent = entry.regenerating ? '다시 쓰는 중…' : '초안 다시 쓰기';
+  btn.textContent = entry.regenerating ? '다시 쓰는 중…' : '다시 쓰기';
   undo.hidden = !same.some((x) => x.previous_body != null);
   undo.disabled = !!(entry.regenerating || entry.saving);
   const req = entry.data.regenerate_request;
@@ -1379,7 +1720,7 @@ function feedbackView(id) {
   const entry = state.mails[id];
   const m = entry.data;
   const fb = { verdict_ok: null, correct_verdict: null, note: '', ...(m.feedback || {}) };
-  const wrap = h('section', { class: 'feedback' }, h('h3', null, '판정 평가'));
+  const wrap = h('details', { class: 'sec feedback' }, h('summary', null, '판정 평가 · 메모', icon('chev', 'chev')));
 
   const change = () => {
     entry.pending.feedback = { ...fb };
@@ -1387,15 +1728,15 @@ function feedbackView(id) {
   };
 
   if (m.verdict) {
-    const correct = h('select', { class: 'select', 'aria-label': '맞는 판정' },
+    const correct = h('select', { class: 'input select', 'aria-label': '맞는 판정' },
       h('option', { value: '' }, '맞는 판정은?'),
       Object.keys(VERDICT_NAME).filter((v) => v !== m.verdict)
         .map((v) => h('option', { value: v, selected: fb.correct_verdict === v }, VERDICT_NAME[v])));
     correct.hidden = fb.verdict_ok !== false;
     correct.addEventListener('change', () => { fb.correct_verdict = correct.value || null; change(); });
 
-    const yes = h('button', { type: 'button', class: 'btn small' }, '👍 맞아요');
-    const no = h('button', { type: 'button', class: 'btn small' }, '👎 아니에요');
+    const yes = h('button', { type: 'button', class: 'btn sm' }, icon('up'), '맞아요');
+    const no = h('button', { type: 'button', class: 'btn sm' }, icon('down'), '아니에요');
     const sync = () => {
       yes.classList.toggle('on', fb.verdict_ok === true);
       no.classList.toggle('on', fb.verdict_ok === false);
@@ -1415,10 +1756,10 @@ function feedbackView(id) {
       change();
     });
     sync();
-    wrap.append(h('div', { class: 'row' }, h('span', null, `판정 ${VERDICT_NAME[m.verdict]}`), yes, no, correct));
+    wrap.append(h('div', { class: 'd-acts' }, h('span', { class: 'muted' }, '판정'), dot(m.verdict), h('b', null, VERDICT_NAME[m.verdict]), yes, no, correct));
   }
 
-  const note = h('textarea', { class: 'note-input', rows: '2', placeholder: '메모 (판정·초안 기준 개선용)', value: fb.note || '' });
+  const note = h('textarea', { class: 'input note-input', rows: '2', placeholder: '메모 (판정·초안 기준 개선용)', value: fb.note || '' });
   note.addEventListener('input', () => { fb.note = note.value; change(); });
   wrap.append(note);
   return wrap;
@@ -1426,7 +1767,7 @@ function feedbackView(id) {
 
 function actionsView(id) {
   const entry = state.mails[id];
-  const wrap = h('section', { class: 'actions' });
+  const wrap = h('section', { class: 'status-row' });
   entry.actions = wrap;
   renderActions(id);
   return wrap;
@@ -1448,10 +1789,10 @@ function renderActions(id) {
       },
     }, label));
   entry.actions.replaceChildren(
-    h('div', { class: 'segs' }, statusBtns),
+    h('div', { class: 'segs' }, h('span', { class: 'segs-label' }, '상태'), statusBtns),
     h('button', {
       type: 'button',
-      class: 'btn primary',
+      class: `btn ${state.dirty.has(id) ? 'dark' : 'ghost'}`,
       disabled: entry.saving || !state.dirty.has(id),
       onclick: () => save(id),
     }, entry.saving ? '저장 중…' : state.dirty.has(id) ? '저장' : '저장됨'),
@@ -1568,7 +1909,7 @@ async function save(id, { quiet = false } = {}) {
     entry.saving = false;
     if (hasPending(entry.pending)) state.dirty.add(id);
     else state.dirty.delete(id);
-    entry.el.className = cardClass(entry.data) + (entry.detail && !entry.detail.hidden ? ' open' : '');
+    if (entry.el) entry.el.className = rowClass(id);
     fillHead(id);
     renderActions(id);
     renderRegen(id);
@@ -1587,6 +1928,15 @@ window.addEventListener('beforeunload', (e) => {
 window.addEventListener('hashchange', () => {
   const want = decodeURIComponent(location.hash.slice(1));
   if (state.token && want !== state.date && state.dates.includes(want)) go(want);
+});
+
+// 폰에서 뒤로 가기 = 상세 닫기
+window.addEventListener('popstate', () => {
+  if (state.ui.shell?.classList.contains('show-detail')) closeDetail(true);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeProfile();
 });
 
 boot();
