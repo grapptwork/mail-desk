@@ -404,6 +404,7 @@ function render() {
       h('label', { class: 'search' }, icon('search'), ui.search),
       h('div', { class: 'top-right' },
         dateSelect,
+        h('button', { type: 'button', class: 'icon-btn', title: '광고 기간 계산', onclick: openAdPeriod }, icon('cal')),
         h('button', { type: 'button', class: 'icon-btn', title: '새로고침', onclick: () => go(state.date) }, icon('refresh')),
         h('button', { type: 'button', class: 'icon-btn', title: '토큰 다시 넣기', onclick: resetToken }, icon('gear')),
         h('div', { class: 'me' }, h('span', { class: 'av me-av' }, '정'),
@@ -542,6 +543,56 @@ function openProfile() {
 
 function closeProfile() {
   if (state.ui.modal) state.ui.modal.hidden = true;
+}
+
+// ---------- 광고 기간 계산 ----------
+// CLAUDE.md 규칙: 업로드 시각 + 기간(일)×24시간이 되는 날의 한국시간 24:00까지.
+// 24시간 단위로 더하면 시각은 그대로라, 업로드 날짜 + 기간(일)의 24:00이 된다.
+
+const WEEKDAY = '일월화수목금토';
+
+function openAdPeriod() {
+  const ui = state.ui;
+  if (!ui.adModal) {
+    const start = h('input', { type: 'date', class: 'input', value: today() });
+    const days = h('input', { type: 'number', class: 'input', min: '1', step: '1', value: '90', inputmode: 'numeric' });
+    const out = h('b', { class: 'ad-out' });
+    let line = '';
+    const copyBtn = h('button', { type: 'button', class: 'btn primary', onclick: () => line && copyText(line) }, icon('copy'), '문구 복사');
+    const calc = () => {
+      const n = Number(days.value);
+      if (!start.value || !Number.isInteger(n) || n < 1) {
+        out.textContent = '업로드일과 기간을 넣어주세요';
+        line = '';
+        copyBtn.disabled = true;
+        return;
+      }
+      const [y, m, d] = start.value.split('-').map(Number);
+      const end = new Date(Date.UTC(y, m - 1, d + n));
+      const ymd = (dt) => dt.toISOString().slice(0, 10).replaceAll('-', '.');
+      out.textContent = `${ymd(end)}(${WEEKDAY[end.getUTCDay()]}) 24:00까지 (KST)`;
+      line = `AD Code 유효기간 : ${start.value.replaceAll('-', '.')} ~ ${ymd(end)} 24:00 (KST, 게시일 기준 ${n}일)`;
+      copyBtn.disabled = false;
+    };
+    start.addEventListener('input', calc);
+    days.addEventListener('input', calc);
+    calc();
+    ui.adModal = h('div', { class: 'modal-bg', hidden: true, onclick: (e) => { if (e.target === ui.adModal) closeAdPeriod(); } },
+      h('div', { class: 'modal', role: 'dialog', 'aria-label': '광고 기간 계산' },
+        h('div', { class: 'modal-head' }, h('h3', null, '광고 기간 계산'),
+          h('button', { type: 'button', class: 'icon-btn', title: '닫기', onclick: closeAdPeriod }, icon('x'))),
+        h('p', { class: 'muted small' }, '업로드일 + 기간(일)이 되는 날의 한국시간 24:00까지예요.'),
+        h('div', { class: 'pf-grid' },
+          h('label', { class: 'pf-row' }, h('span', { class: 'pf-label' }, '업로드일'), start),
+          h('label', { class: 'pf-row' }, h('span', { class: 'pf-label' }, '기간(일)'), days)),
+        h('div', { class: 'row-end' }, out, copyBtn)));
+    document.body.append(ui.adModal);
+  }
+  ui.adModal.hidden = false;
+}
+
+function closeAdPeriod() {
+  if (state.ui.adModal) state.ui.adModal.hidden = true;
 }
 
 // 사이드바 카드(PC)와 목록 위 한 줄(폰)
@@ -2141,7 +2192,7 @@ window.addEventListener('popstate', () => {
 });
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeProfile();
+  if (e.key === 'Escape') { closeProfile(); closeAdPeriod(); }
 });
 
 boot();
