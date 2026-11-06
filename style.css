@@ -108,7 +108,6 @@ textarea { resize: vertical; }
 .search-input { border: 0; background: none; outline: 0; width: 100%; font-size: 13px; color: var(--text); }
 .search-input::placeholder { color: var(--faint); }
 .top-right { margin-left: auto; display: flex; align-items: center; gap: 4px; }
-.date-select { display: none; }
 .me { display: flex; align-items: center; gap: 9px; margin-left: 10px; padding-left: 14px; border-left: 1px solid var(--line); }
 .me .me-av { width: 30px; height: 30px; font-size: 12px; background: var(--ink); color: #fff; font-family: inherit; }
 .me b { display: block; font-size: 13px; line-height: 1.2; }
@@ -143,12 +142,6 @@ textarea { resize: vertical; }
 .nav.on { background: var(--ink-soft); color: var(--text); font-weight: 600; }
 .nav.on svg.i { color: var(--ink); }
 .nav.on .n { background: var(--card); color: var(--text); }
-.side h4 { margin: 18px 12px 6px; font-size: 12px; color: var(--faint); font-weight: 600; letter-spacing: 0; }
-.dates { display: flex; flex-direction: column; gap: 2px; }
-.date-row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-radius: 10px; font-size: 13px; color: var(--text-2); text-align: left; }
-.date-row svg.i { width: 16px; height: 16px; color: var(--faint); }
-.date-row:hover { background: var(--soft); }
-.date-row.on { background: var(--soft); font-weight: 600; color: var(--text); }
 .side-notes { margin: 16px 8px 0; font-size: 12px; color: var(--muted); }
 .side-notes summary { cursor: pointer; }
 .side-notes ul { padding-left: 16px; margin: 6px 0; }
@@ -156,6 +149,11 @@ textarea { resize: vertical; }
 /* 목록 */
 .list { border-right: 1px solid var(--line); padding: 12px 10px 24px; overflow-y: auto; }
 .status-strip, .chips { display: none; }
+.check-bar { margin: 0 12px 6px; min-height: 16px; font-size: 12px; color: var(--faint); }
+.check-bar.err { color: var(--red); }
+.icon-btn.spin svg { animation: check-spin 1s linear infinite; }
+@keyframes check-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .icon-btn.spin svg { animation-duration: 3s; } }
 .empty { text-align: center; color: var(--muted); padding: 48px 0; }
 .row {
   position: relative; display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; gap: 0 12px;
@@ -388,7 +386,6 @@ code { background: var(--soft); padding: 1px 5px; border-radius: 4px; font-size:
   .shell { display: block; height: auto; min-height: 100vh; margin: 0; border-radius: 0; box-shadow: none; overflow: visible; }
   .side, .search, .me { display: none; }
   .topbar { position: sticky; top: 0; z-index: 5; height: 54px; padding: 0 12px 0 16px; background: rgba(255, 255, 255, .94); backdrop-filter: blur(8px); }
-  .date-select { display: block; height: 32px; padding: 0 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); font-size: 13px; }
   .list { border: 0; padding: 8px 10px 40px; overflow: visible; }
   .status-strip {
     display: flex; align-items: center; gap: 8px; width: calc(100% - 4px); margin: 4px 2px 6px; padding: 10px 12px;
@@ -425,7 +422,6 @@ code { background: var(--soft); padding: 1px 5px; border-radius: 4px; font-size:
   .show-detail .detail { display: block; padding: 14px 16px 110px; overflow: visible; }
   .show-detail .logo { display: none; }
   .show-detail .back { display: flex; align-items: center; gap: 4px; font-weight: 600; font-size: 15px; margin-left: -6px; }
-  .show-detail .date-select { display: none; }
 
   .d-from { flex: 1; }
   .d-head .time { display: none; }

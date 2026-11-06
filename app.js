@@ -17,6 +17,22 @@ const REGEN_WAIT_MS = 6 * 60e3;
 
 const PROFILE_PATH = 'db/profile.json';
 
+// 「새 메일 확인」 작업(check-mail.yml)이 진행 상태를 남기는 파일
+const CHECK_PATH = 'db/mail-check.json';
+
+// 사이트를 열 때 이 시간 안에 확인한 적이 있으면 다시 확인하지 않는다. ⟳ 버튼은 항상 확인한다.
+const AUTO_CHECK_GAP_MS = 5 * 60e3;
+
+const CHECK_POLL_MS = 6000;
+
+// 작업이 시작돼 Gmail을 다 볼 때까지 / 새 메일 분석이 끝날 때까지 기다리는 시간
+const CHECK_START_WAIT_MS = 3 * 60e3;
+
+const CHECK_ANALYZE_WAIT_MS = 15 * 60e3;
+
+// 브라우저 시계와 서버 시계의 차이를 봐준다.
+const CHECK_CLOCK_SKEW_MS = 15e3;
+
 const TOKEN_KEY = 'maildesk.token';
 
 const FILTER_KEY = 'maildesk.filter2';
@@ -51,11 +67,12 @@ const COMPANY_TYPE = { agency: '대행사', brand: '브랜드 직접', unknown: 
 
 const state = {
   token: null,
-  dates: [],
-  date: null,
-  digest: null,
+  digests: {},    // 경로 -> { sha, data } (다이제스트 파일)
+  lines: {},      // id -> 목록에 보일 요약 한 줄 (다이제스트에서 모음)
+  notes: [],      // 가장 최근 다이제스트의 라우틴 메모
   mails: {},      // id -> { path, data, sha, pending, saving, el(목록 행), detail(상세), ... }
-  order: [],
+  order: [],      // 받은 시각 최신순
+  check: { running: false, data: null, text: '', err: false },  // 새 메일 확인 상태
   dirty: new Set(),
   db: null,       // Promise<{services, companies}>
   filter: lsGet(FILTER_KEY) || 'todo',
@@ -226,10 +243,6 @@ async function gh(path, opts = {}) {
 
 const contents = (path) => `/repos/${REPO}/contents/${encPath(path)}`;
 
-function listDir(path) {
-  return gh(`${contents(path)}?ref=${BRANCH}`);
-}
-
 async function readJson(path) {
   const f = await gh(`${contents(path)}?ref=${BRANCH}`);
   return { data: JSON.parse(b64decode(f.content)), sha: f.sha };
@@ -246,7 +259,7 @@ async function writeJson(path, data, sha, message) {
   return r.content.sha;
 }
 
-// 비공개 repo의 .github/workflows/ 작업을 깨운다. (translate-draft → translate.yml, research-more → research.yml)
+// 비공개 repo의 .github/workflows/ 작업을 깨운다. (translate-draft → translate.yml, research-more → research.yml, check-mail → check-mail.yml)
 // 처리할 메일은 워크플로가 파일의 translate_request / research_request로 찾는다.
 function dispatch(eventType) {
   return gh(`/repos/${REPO}/dispatches`, { method: 'POST', body: JSON.stringify({ event_type: eventType }) });
@@ -268,59 +281,183 @@ async function boot() {
   if (!state.token) return renderSetup();
   loadProfile();
   try {
-    await loadDates();
+    await loadMails();
+    // 예전 날짜 링크(#2026-10-30)는 이제 쓰지 않는다.
+    if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+    render();
+    initCheck();
   } catch (e) {
     if (e.status === 401) return renderSetup('토큰이 맞지 않거나 만료됐어요. 다시 넣어주세요.');
     renderFatal(errMsg(e));
   }
 }
 
-async function loadDates() {
-  const items = await listDir('inbox');
-  state.dates = items
-    .filter((i) => i.type === 'dir' && /^\d{4}-\d{2}-\d{2}$/.test(i.name))
-    .map((i) => i.name)
-    .sort()
-    .reverse();
-  if (!state.dates.length) return renderFatal('아직 처리된 메일이 없어요.');
-  const want = decodeURIComponent(location.hash.slice(1));
-  await loadDate(state.dates.includes(want) ? want : state.dates[0]);
+async function readBlob(sha) {
+  const f = await gh(`/repos/${REPO}/git/blobs/${sha}`);
+  return JSON.parse(b64decode(f.content));
 }
 
-function go(date) {
-  loadDate(date).catch((e) => renderFatal(errMsg(e)));
+// 작업을 n개씩 나눠 돌린다. (메일 수만큼 한꺼번에 요청하지 않게)
+async function runPool(tasks, n = 8) {
+  const queue = [...tasks];
+  await Promise.all(Array.from({ length: Math.min(n, queue.length) }, async () => {
+    while (queue.length) await queue.shift()();
+  }));
 }
 
-async function loadDate(date) {
-  if (state.dirty.size && !confirm('저장하지 않은 수정이 있어요. 버리고 이동할까요?')) {
-    render();
+// 쓰던 내용이나 진행 중인 작업이 있는 메일은 이번 새로고침에서 건드리지 않는다.
+function isBusy(id) {
+  const entry = state.mails[id];
+  return state.dirty.has(id) || entry.saving || entry.watching || entry.dirBusy || entry.jobs > 0;
+}
+
+// 저장소 파일 목록을 한 번에 받아 모든 날짜의 메일을 합친다. 바뀐 파일만 새로 읽는다.
+async function loadMails() {
+  const { tree } = await gh(`/repos/${REPO}/git/trees/${BRANCH}?recursive=1`);
+  const files = tree.filter((f) => f.type === 'blob' && /^inbox\/\d{4}-\d{2}-\d{2}\/[^/]+\.json$/.test(f.path));
+  const digestFiles = files.filter((f) => f.path.endsWith('/_digest.json'));
+  const mailFiles = files.filter((f) => !f.path.endsWith('/_digest.json'));
+
+  // 다이제스트 먼저: 목록 행이 요약 한 줄을 쓴다.
+  const digests = {};
+  await runPool(digestFiles.map((f) => async () => {
+    const old = state.digests[f.path];
+    if (old?.sha === f.sha) { digests[f.path] = old; return; }
+    const data = await readBlob(f.sha).catch(() => null);
+    if (data) digests[f.path] = { sha: f.sha, data };
+  }));
+  state.digests = digests;
+  const paths = Object.keys(digests).sort();
+  state.lines = Object.assign({}, ...paths.map((p) => digests[p].data.lines || {}));
+  state.notes = paths.length ? digests[paths[paths.length - 1]].data.notes || [] : [];
+
+  const idOf = (f) => f.path.split('/').pop().replace(/\.json$/, '');
+  const seen = new Set(mailFiles.map(idOf));
+  const changed = mailFiles.filter((f) => {
+    const id = idOf(f);
+    return !state.mails[id] || (state.mails[id].sha !== f.sha && !isBusy(id));
+  });
+  await runPool(changed.map((f) => async () => {
+    const data = await readBlob(f.sha).catch(() => null);
+    if (!data) return;
+    const id = idOf(f);
+    const entry = state.mails[id];
+    if (!entry) {
+      state.mails[id] = { path: f.path, data, sha: f.sha, pending: emptyPending(), saving: false, el: null };
+      return;
+    }
+    if (isBusy(id)) return;
+    entry.path = f.path;
+    entry.data = data;
+    entry.sha = f.sha;
+    rebuildDetail(id);
+    fillHead(id);
+  }));
+
+  // 기간이 지나 지워진 메일은 화면에서도 뺀다.
+  for (const id of Object.keys(state.mails)) {
+    if (seen.has(id) || isBusy(id)) continue;
+    delete state.mails[id];
+    if (state.sel === id) {
+      state.sel = null;
+      if (state.ui.pane) renderDetailPane();
+    }
+  }
+  const at = (id) => Date.parse(state.mails[id].data.received_at) || 0;
+  state.order = Object.keys(state.mails).sort((a, b) => at(b) - at(a));
+  if (state.ui.rows) {
+    renderList();
+    renderNotes();
+  }
+}
+
+// ---------- 새 메일 확인 ----------
+// ⟳를 누르거나 사이트를 열면 비공개 repo의 check-mail.yml을 깨운다. 그 작업이 Gmail(스팸함 포함)을 보고
+// 새 메일이 있을 때만 분석해 커밋한다. 진행 상태는 db/mail-check.json에 남긴다.
+
+async function readCheck() {
+  return readJson(CHECK_PATH).then((r) => r.data).catch((e) => {
+    if (e.status === 404) return null;
+    throw e;
+  });
+}
+
+function setCheck(patch) {
+  Object.assign(state.check, patch);
+  renderCheck();
+}
+
+function renderCheck() {
+  const { checkBar, refreshBtn } = state.ui;
+  const c = state.check;
+  refreshBtn?.classList.toggle('spin', c.running);
+  if (!checkBar) return;
+  checkBar.classList.toggle('err', c.err);
+  const at = c.data?.checked_at;
+  checkBar.textContent = c.text || (at ? `마지막 확인 ${fmtTime(at)}` : '');
+}
+
+// 사이트를 열 때: 진행 중인 작업이 있으면 이어서 지켜보고, 오래됐으면 새로 확인한다.
+async function initCheck() {
+  const st = await readCheck().catch(() => null);
+  setCheck({ data: st });
+  const age = st?.checked_at ? Date.now() - Date.parse(st.checked_at) : Infinity;
+  if (st?.status === 'error') {
+    // 실패가 반복될 때 사이트를 열 때마다 사용량을 쓰지 않게, 다시 시도는 ⟳를 눌렀을 때만 한다.
+    setCheck({ err: true, text: st.error || '새 메일을 확인하지 못했어요' });
+  } else if (st?.status === 'analyzing' && age < CHECK_ANALYZE_WAIT_MS) {
+    watchCheck(Date.parse(st.checked_at) - 1, { quiet: true });
+  } else if (age > AUTO_CHECK_GAP_MS) {
+    checkMail({ quiet: true });
+  }
+}
+
+async function checkMail({ quiet = false } = {}) {
+  if (state.check.running) return;
+  setCheck({ running: true, err: false, text: '새 메일 확인 중…' });
+  const pressed = Date.now();
+  // 아침 라우틴·다른 기기에서 바뀐 내용은 기다리지 않고 바로 보여준다.
+  loadMails().catch(() => {});
+  try {
+    await dispatch('check-mail');
+  } catch (e) {
+    setCheck({ running: false, err: true, text: `새 메일 확인을 시작하지 못했어요: ${errMsg(e)}` });
     return;
   }
-  if (state.ui.rows) state.ui.rows.replaceChildren(h('p', { class: 'empty' }, `${dateLabel(date)} 불러오는 중…`));
-  else document.getElementById('app').replaceChildren(h('p', { class: 'muted center' }, '불러오는 중…'));
-  const files = (await listDir(`inbox/${date}`)).filter((f) => f.type === 'file' && f.name.endsWith('.json'));
-  const digestFile = files.find((f) => f.name === '_digest.json');
-  const mailFiles = files.filter((f) => f.name !== '_digest.json');
+  await watchCheck(pressed, { quiet });
+}
 
-  const [digest, ...mails] = await Promise.all([
-    digestFile ? readJson(digestFile.path).then((r) => r.data).catch(() => null) : null,
-    ...mailFiles.map((f) => readJson(f.path).then((r) => ({ ...r, path: f.path })).catch(() => null)),
-  ]);
-
-  state.date = date;
-  state.digest = digest;
-  state.mails = {};
-  state.dirty.clear();
-  state.sel = null;
-  for (const m of mails) {
-    if (!m) continue;
-    const id = m.data.id || m.path.split('/').pop().replace(/\.json$/, '');
-    state.mails[id] = { path: m.path, data: m.data, sha: m.sha, pending: emptyPending(), saving: false, el: null };
+async function watchCheck(after, { quiet }) {
+  const before = new Set(Object.keys(state.mails));
+  setCheck({ running: true, err: false, text: state.check.text || '새 메일 확인 중…' });
+  const started = Date.now();
+  const stop = (text) => setCheck({ running: false, err: true, text });
+  for (;;) {
+    await sleep(CHECK_POLL_MS);
+    const st = await readCheck().catch(() => null);
+    const fresh = st?.checked_at && Date.parse(st.checked_at) > after - CHECK_CLOCK_SKEW_MS;
+    const waited = Date.now() - started;
+    if (!fresh) {
+      if (waited > CHECK_START_WAIT_MS) return stop('새 메일 확인이 늦어지고 있어요. 잠시 뒤 ⟳를 다시 눌러 주세요');
+      continue;
+    }
+    if (st.status === 'error') {
+      setCheck({ data: st });
+      await loadMails().catch(() => {});
+      return stop(st.error || '새 메일을 확인하지 못했어요');
+    }
+    if (st.status === 'analyzing') {
+      setCheck({ text: `새 메일 ${st.new}건 분석 중… 보통 1~3분 걸려요` });
+      if (waited > CHECK_ANALYZE_WAIT_MS) return stop('분석이 오래 걸리고 있어요. 잠시 뒤 ⟳를 다시 눌러 주세요');
+      continue;
+    }
+    await loadMails().catch(() => {});
+    setCheck({ running: false, err: false, text: '', data: st });
+    const added = Object.keys(state.mails).filter((id) => !before.has(id)).length;
+    if (added) toast(`새 메일 ${added}건을 가져왔어요`);
+    else if (!quiet) toast('새 메일이 없어요');
+    return;
   }
-  const listed = (digest?.order || []).filter((id) => state.mails[id]);
-  state.order = [...listed, ...Object.keys(state.mails).filter((id) => !listed.includes(id))];
-  if (location.hash.slice(1) !== date) history.replaceState(null, '', `#${date}`);
-  render();
 }
 
 function renderSetup(message) {
@@ -393,9 +530,9 @@ function render() {
   ui.pfCard = h('button', { type: 'button', class: 'pf-card', onclick: openProfile });
   ui.pfStrip = h('button', { type: 'button', class: 'status-strip', onclick: openProfile });
   ui.mbar = mobileBar();
-
-  const dateSelect = h('select', { class: 'date-select', 'aria-label': '날짜', onchange: (e) => go(e.target.value) },
-    state.dates.map((d) => h('option', { value: d, selected: d === state.date }, dateLabel(d))));
+  ui.checkBar = h('p', { class: 'check-bar', role: 'status' });
+  ui.notes = h('div');
+  ui.refreshBtn = h('button', { type: 'button', class: 'icon-btn', title: '새 메일 확인', 'aria-label': '새 메일 확인', onclick: () => checkMail() }, icon('refresh'));
 
   ui.shell = h('div', { class: 'shell' },
     h('header', { class: 'topbar' },
@@ -403,9 +540,8 @@ function render() {
       h('div', { class: 'logo' }, h('span', { class: 'mark' }, icon('send')), '협업메일'),
       h('label', { class: 'search' }, icon('search'), ui.search),
       h('div', { class: 'top-right' },
-        dateSelect,
         h('button', { type: 'button', class: 'icon-btn', title: '광고 기간 계산', onclick: openAdPeriod }, icon('cal')),
-        h('button', { type: 'button', class: 'icon-btn', title: '새로고침', onclick: () => go(state.date) }, icon('refresh')),
+        ui.refreshBtn,
         h('button', { type: 'button', class: 'icon-btn', title: '토큰 다시 넣기', onclick: resetToken }, icon('gear')),
         h('div', { class: 'me' }, h('span', { class: 'av me-av' }, '정'),
           h('div', null, h('b', null, '정원'), h('small', null, GMAIL_ACCOUNT))),
@@ -415,19 +551,17 @@ function render() {
       h('button', { type: 'button', class: 'cta', onclick: openProfile }, icon('chart'), '채널 현황'),
       ui.pfCard,
       ui.nav,
-      h('h4', null, '날짜'),
-      h('div', { class: 'dates' }, state.dates.map((d) => h('button', {
-        type: 'button', class: `date-row${d === state.date ? ' on' : ''}`, onclick: () => go(d),
-      }, icon('cal'), dateLabel(d)))),
-      digestNotes(),
+      ui.notes,
     ),
-    h('section', { class: 'list' }, ui.pfStrip, ui.chips, ui.rows),
+    h('section', { class: 'list' }, ui.pfStrip, ui.chips, ui.checkBar, ui.rows),
     ui.pane,
     ui.mbar.el,
   );
   document.getElementById('app').replaceChildren(ui.shell);
   renderPfCard();
   renderList();
+  renderNotes();
+  renderCheck();
   // PC는 첫 메일을 바로 연다.
   if (!state.sel && !isNarrow()) {
     const first = visibleIds()[0];
@@ -439,16 +573,11 @@ function render() {
   }
 }
 
-function dateLabel(d) {
-  return `${Number(d.slice(5, 7))}월 ${Number(d.slice(8, 10))}일`;
-}
-
-function digestNotes() {
-  const notes = state.digest?.notes || [];
-  if (!notes.length) return null;
-  return h('details', { class: 'side-notes' },
+function renderNotes() {
+  const notes = state.notes;
+  state.ui.notes.replaceChildren(...(notes.length ? [h('details', { class: 'side-notes' },
     h('summary', null, `라우틴 메모 ${notes.length}`),
-    h('ul', null, notes.map((n) => h('li', null, n))));
+    h('ul', null, notes.map((n) => h('li', null, n))))] : []));
 }
 
 // ---------- 채널 현황 ----------
@@ -803,7 +932,7 @@ function renderList() {
   rows.replaceChildren(...ids.map((id) => getRow(id)));
 }
 
-// 목록 행 DOM은 날짜를 바꿀 때까지 재사용한다.
+// 목록 행 DOM은 재사용한다. 메일이 바뀌면 fillHead가 내용을 다시 채운다.
 function getRow(id) {
   const entry = state.mails[id];
   if (entry.el) return entry.el;
@@ -821,7 +950,7 @@ function getRow(id) {
 }
 
 function snippet(id, m) {
-  let s = state.digest?.lines?.[id] || '';
+  let s = state.lines[id] || '';
   s = s.replace(/^[^\p{L}\p{N}]+/u, '').replace(/^(후속|중복)\s+/, '');
   const b = m.brand?.name;
   if (b && s.startsWith(b)) s = s.slice(b.length).replace(/^\([^)]*\)/, '');
@@ -1831,20 +1960,25 @@ function renderTranslation(id) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 워크플로가 field 요청을 지우거나 error를 남길 때까지 파일을 다시 읽는다.
-// 끝나면 { fresh }, 너무 오래 걸리면 { timeout: true }, 날짜를 옮겨 화면이 바뀌었으면 null.
+// 끝나면 { fresh }, 너무 오래 걸리면 { timeout: true }, 메일이 목록에서 사라졌으면 null.
 async function waitForJob(id, field, waitMs) {
   const entry = state.mails[id];
   const started = Date.parse(entry.data[field]?.requested_at) || Date.now();
-  while (state.mails[id] === entry) {
-    await sleep(8000);
-    if (state.mails[id] !== entry) return null;
-    const fresh = await readJson(entry.path).catch(() => null);
-    if (!fresh) continue;
-    const req = fresh.data[field];
-    if (!req || req.error) return { fresh };
-    if (Date.now() - started > waitMs) return { timeout: true };
+  entry.jobs = (entry.jobs || 0) + 1;
+  try {
+    while (state.mails[id] === entry) {
+      await sleep(8000);
+      if (state.mails[id] !== entry) return null;
+      const fresh = await readJson(entry.path).catch(() => null);
+      if (!fresh) continue;
+      const req = fresh.data[field];
+      if (!req || req.error) return { fresh };
+      if (Date.now() - started > waitMs) return { timeout: true };
+    }
+    return null;
+  } finally {
+    entry.jobs -= 1;
   }
-  return null;
 }
 
 async function watchTranslation(id) {
@@ -2179,11 +2313,6 @@ window.addEventListener('beforeunload', (e) => {
     e.preventDefault();
     e.returnValue = '';
   }
-});
-
-window.addEventListener('hashchange', () => {
-  const want = decodeURIComponent(location.hash.slice(1));
-  if (state.token && want !== state.date && state.dates.includes(want)) go(want);
 });
 
 // 폰에서 뒤로 가기 = 상세 닫기
