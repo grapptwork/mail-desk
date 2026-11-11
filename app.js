@@ -82,6 +82,7 @@ const state = {
   sel: null,      // 보고 있는 메일 id
   ui: {},         // 화면 틀의 고정 요소들
   profile: { data: null, sha: null, loaded: false, saving: false, error: null, el: null },
+  sg: { data: null, sha: null, loaded: false, saving: false, watching: false, error: null, note: null, unchecked: new Set() },
 };
 
 // 폰 폭이면 목록·상세를 한 장씩 보여준다.
@@ -282,6 +283,7 @@ async function boot() {
   state.token = lsGet(TOKEN_KEY);
   if (!state.token) return renderSetup();
   loadProfile();
+  loadSuggest();
   try {
     await loadMails();
     // 예전 날짜 링크(#2026-10-30)는 이제 쓰지 않는다.
@@ -534,6 +536,8 @@ function render() {
   ui.mbar = mobileBar();
   ui.checkBar = h('p', { class: 'check-bar', role: 'status' });
   ui.notes = h('div');
+  ui.sgNav = h('button', { type: 'button', class: 'nav sg-nav', onclick: openSuggest });
+  ui.sgTop = h('button', { type: 'button', class: 'icon-btn sg-top', title: '개선 의견', 'aria-label': '개선 의견', onclick: openSuggest }, icon('pen'));
   ui.refreshBtn = h('button', { type: 'button', class: 'icon-btn', title: '새 메일 확인', 'aria-label': '새 메일 확인', onclick: () => checkMail() }, icon('refresh'));
 
   ui.shell = h('div', { class: 'shell' },
@@ -542,6 +546,7 @@ function render() {
       h('div', { class: 'logo' }, h('span', { class: 'mark' }, icon('send')), '협업메일'),
       h('label', { class: 'search' }, icon('search'), ui.search),
       h('div', { class: 'top-right' },
+        ui.sgTop,
         h('button', { type: 'button', class: 'icon-btn', title: '광고 기간 계산', onclick: openAdPeriod }, icon('cal')),
         ui.refreshBtn,
         h('button', { type: 'button', class: 'icon-btn', title: '토큰 다시 넣기', onclick: resetToken }, icon('gear')),
@@ -553,6 +558,7 @@ function render() {
       h('button', { type: 'button', class: 'cta', onclick: openProfile }, icon('chart'), '채널 현황'),
       ui.pfCard,
       ui.nav,
+      ui.sgNav,
       ui.notes,
     ),
     h('section', { class: 'list' }, ui.pfStrip, ui.chips, ui.checkBar, ui.rows),
@@ -674,6 +680,331 @@ function openProfile() {
 
 function closeProfile() {
   if (state.ui.modal) state.ui.modal.hidden = true;
+}
+
+// ---------- 개선 의견 ----------
+// 정원이 답장 말투·규칙에 대해 떠오르는 걸 메모해 두면, 비공개 repo의 suggest.yml이 지침(CLAUDE.md 등) 변경안을 만든다.
+// 변경안은 바로 적용되지 않는다. 정원이 수정마다 읽고 고른 것만 적용 요청 → 같은 작업이 적용·커밋한다.
+// 형식: 비공개 repo automation/스키마.md 「개선 의견」.
+
+const SUGGEST_PATH = 'db/suggestions.json';
+
+const SUGGEST_WAIT_MS = 20 * 60e3;
+
+const SG_EMPTY = () => ({ schema: 1, memos: [], proposal: null, history: [] });
+
+const sgBusy = (d) => ['requested', 'applying'].includes(d?.proposal?.status);
+
+async function loadSuggest() {
+  const sg = state.sg;
+  try {
+    const r = await readJson(SUGGEST_PATH);
+    sg.data = r.data;
+    sg.sha = r.sha;
+    sg.error = null;
+  } catch (e) {
+    if (e.status === 404) {
+      sg.data = SG_EMPTY();
+      sg.sha = null;
+    } else sg.error = `개선 의견을 못 불러왔어요: ${errMsg(e)}`;
+  }
+  sg.loaded = true;
+  renderSuggest();
+  if (sgBusy(sg.data)) watchSuggest();
+}
+
+// 최신 파일을 읽어 fn으로 고친 뒤 저장한다. 자동 작업이 그 사이 고쳤으면 다시 읽어 한 번 더.
+// fn이 false를 돌려주면 저장하지 않는다.
+async function mutateSuggest(fn, message) {
+  const sg = state.sg;
+  for (let attempt = 0; ; attempt++) {
+    let data = SG_EMPTY();
+    let sha;
+    try {
+      const r = await readJson(SUGGEST_PATH);
+      data = r.data;
+      sha = r.sha;
+    } catch (e) {
+      if (e.status !== 404) throw e;
+    }
+    if (fn(data) === false) {
+      sg.data = data;
+      sg.sha = sha;
+      return false;
+    }
+    try {
+      sg.sha = await writeJson(SUGGEST_PATH, data, sha, message);
+      sg.data = data;
+      return true;
+    } catch (e) {
+      if ((e.status === 409 || e.status === 422) && attempt < 2) continue;
+      throw e;
+    }
+  }
+}
+
+async function sgRun(fn, message, okText) {
+  const sg = state.sg;
+  if (sg.saving) return false;
+  sg.saving = true;
+  renderSuggest();
+  try {
+    const done = await mutateSuggest(fn, message);
+    if (done && okText) toast(okText);
+    return done;
+  } catch (e) {
+    toast(`저장 실패: ${errMsg(e)}`, true);
+    return false;
+  } finally {
+    sg.saving = false;
+    renderSuggest();
+  }
+}
+
+async function addMemo() {
+  const ta = state.sg.input;
+  const text = ta.value.trim();
+  if (!text) return;
+  const id = `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+  const ok = await sgRun((d) => { (d.memos ||= []).push({ id, text, at: nowKst() }); }, 'site: 개선 의견 메모', '메모를 남겼어요');
+  if (ok) {
+    ta.value = '';
+    autosize(ta);
+  }
+}
+
+function delMemo(id) {
+  sgRun((d) => {
+    const before = (d.memos || []).length;
+    d.memos = (d.memos || []).filter((m) => m.id !== id);
+    if (d.memos.length === before) return false;
+  }, 'site: 개선 의견 메모 지움', '메모를 지웠어요');
+}
+
+async function requestProposal() {
+  let busy = false;
+  const ok = await sgRun((d) => {
+    if (sgBusy(d)) { busy = true; return false; }
+    if (!(d.memos || []).length) return false;
+    d.proposal = { status: 'requested', requested_at: nowKst() };
+  }, 'site: 지침 변경안 요청');
+  if (busy) return watchSuggest();
+  if (!ok) return;
+  try {
+    await dispatch('suggest-propose');
+  } catch (e) {
+    toast(`변경안 만들기를 시작하지 못했어요: ${errMsg(e)}`, true);
+  }
+  watchSuggest();
+}
+
+async function applyProposal() {
+  const sg = state.sg;
+  const p = sg.data?.proposal;
+  if (!p || p.status !== 'ready') return;
+  const accepted = (p.changes || []).map((_, i) => i).filter((i) => !sg.unchecked.has(`${p.created_at}#${i}`));
+  if (!accepted.length) return toast('적용할 수정을 하나 이상 골라주세요', true);
+  let moved = false;
+  const ok = await sgRun((d) => {
+    if (d.proposal?.status !== 'ready' || d.proposal.created_at !== p.created_at) { moved = true; return false; }
+    d.proposal.status = 'applying';
+    d.proposal.apply = { accepted, requested_at: nowKst() };
+  }, 'site: 지침 변경안 적용 요청');
+  if (moved) return toast('그 사이 변경안이 바뀌었어요. 다시 확인해 주세요', true);
+  if (!ok) return;
+  try {
+    await dispatch('suggest-apply');
+  } catch (e) {
+    toast(`적용을 시작하지 못했어요: ${errMsg(e)}`, true);
+  }
+  watchSuggest();
+}
+
+function discardProposal() {
+  sgRun((d) => {
+    if (!d.proposal || d.proposal.status === 'applying') return false;
+    d.proposal = null;
+  }, 'site: 지침 변경안 버림', '변경안을 버렸어요. 메모는 남아 있어요');
+}
+
+async function watchSuggest() {
+  const sg = state.sg;
+  if (sg.watching) return;
+  sg.watching = true;
+  sg.note = null;
+  renderSuggest();
+  const was = sg.data?.proposal?.status;
+  const started = Date.parse(sg.data?.proposal?.apply?.requested_at || sg.data?.proposal?.requested_at) || Date.now();
+  try {
+    for (;;) {
+      await sleep(8000);
+      const r = await readJson(SUGGEST_PATH).catch(() => null);
+      if (r) {
+        sg.data = r.data;
+        sg.sha = r.sha;
+      }
+      if (!sgBusy(sg.data)) break;
+      if (Date.now() - started > SUGGEST_WAIT_MS) {
+        sg.note = '오래 걸리고 있어요. 잠시 뒤 창을 다시 열어 확인해 주세요';
+        break;
+      }
+      renderSuggest();
+    }
+    const p = sg.data?.proposal;
+    if (!sg.note) {
+      if (was === 'applying' && !p) toast('지침에 반영했어요');
+      else if (p?.status === 'ready') toast('지침 변경안이 도착했어요', false, sg.modal?.hidden === false ? undefined : { label: '보기', fn: openSuggest });
+      else if (p?.status === 'error') toast('변경안 작업에 실패했어요', true);
+    }
+  } finally {
+    sg.watching = false;
+    renderSuggest();
+  }
+}
+
+// 사이드바 칸 · 폰 상단 버튼의 작은 표시
+function renderSgBadge() {
+  const sg = state.sg;
+  const d = sg.data;
+  const ready = d?.proposal?.status === 'ready';
+  const n = (d?.memos || []).length;
+  if (state.ui.sgNav) {
+    state.ui.sgNav.replaceChildren(icon('pen'), '개선 의견',
+      ready ? h('span', { class: 'n new' }, '변경안') : n ? h('span', { class: 'n' }, n) : null);
+  }
+  state.ui.sgTop?.classList.toggle('has-dot', ready);
+}
+
+function openSuggest() {
+  const sg = state.sg;
+  if (!sg.modal) {
+    sg.input = h('textarea', {
+      class: 'input memo-input', rows: '2',
+      placeholder: '예: 영어 답장에서 Hope you\'re doing well 같은 인사는 빼줘',
+    });
+    sg.input.addEventListener('input', () => autosize(sg.input));
+    sg.input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) addMemo(); });
+    sg.addBtn = h('button', { type: 'button', class: 'btn primary', onclick: addMemo }, '메모 남기기');
+    sg.body = h('div', { class: 'sg-body' });
+    sg.modal = h('div', { class: 'modal-bg', hidden: true, onclick: (e) => { if (e.target === sg.modal) closeSuggest(); } },
+      h('div', { class: 'modal sg-modal', role: 'dialog', 'aria-label': '개선 의견' },
+        h('div', { class: 'modal-head' }, h('h3', null, '개선 의견'),
+          h('button', { type: 'button', class: 'icon-btn', title: '닫기', onclick: closeSuggest }, icon('x'))),
+        h('p', { class: 'muted small' }, '답장 말투·규칙에 대해 떠오르는 걸 짧게 남겨 두세요. 모아서 지침 변경안을 만들고, 확인하고 고른 것만 반영해요. 매일 아침 8:40에도 메모가 있으면 변경안을 미리 만들어 둬요.'),
+        sg.input,
+        h('div', { class: 'row-end sg-add' }, sg.addBtn),
+        sg.body));
+    document.body.append(sg.modal);
+  }
+  sg.modal.hidden = false;
+  renderSuggest();
+  if (sg.loaded && !sg.watching) loadSuggest();
+}
+
+function closeSuggest() {
+  if (state.sg.modal) state.sg.modal.hidden = true;
+}
+
+function renderSuggest() {
+  renderSgBadge();
+  const sg = state.sg;
+  if (!sg.body || sg.modal.hidden) return;
+  sg.addBtn.disabled = sg.saving;
+  if (!sg.loaded) return sg.body.replaceChildren(h('p', { class: 'muted small' }, '불러오는 중…'));
+  if (sg.error) return sg.body.replaceChildren(h('p', { class: 'err small' }, sg.error));
+  const d = sg.data || SG_EMPTY();
+  const p = d.proposal;
+  const memos = d.memos || [];
+  const inProposal = new Set(p?.memo_ids || []);
+  const memoNo = (id) => {
+    const i = (p?.memo_ids || []).indexOf(id);
+    return i < 0 ? '' : `${i + 1}`;
+  };
+  const parts = [];
+
+  // 메모 목록
+  parts.push(h('h4', { class: 'sg-h' }, `메모 ${memos.length}`));
+  if (!memos.length) parts.push(h('p', { class: 'muted small' }, '남겨 둔 메모가 없어요'));
+  else {
+    parts.push(h('ul', { class: 'sg-memos' }, memos.map((m) => h('li', null,
+      inProposal.has(m.id) ? h('span', { class: 'sg-no' }, memoNo(m.id)) : null,
+      h('span', { class: 'sg-text' }, m.text),
+      h('small', { class: 'muted' }, fmtTime(m.at)),
+      h('button', {
+        type: 'button', class: 'icon-btn sg-del', title: '메모 지우기', 'aria-label': '메모 지우기',
+        disabled: sg.saving || p?.status === 'applying', onclick: () => delMemo(m.id),
+      }, icon('x'))))));
+  }
+
+  // 변경안
+  parts.push(h('h4', { class: 'sg-h' }, '지침 변경안'));
+  const status = p?.status;
+  if (!p) {
+    parts.push(h('div', { class: 'row-end sg-act' },
+      h('span', { class: 'muted' }, memos.length ? '메모를 모아 지침 수정안을 만들어요 (보통 2~5분)' : '메모를 남기면 만들 수 있어요'),
+      h('button', { type: 'button', class: 'btn', disabled: sg.saving || !memos.length, onclick: requestProposal }, icon('wand'), '지금 변경안 만들기')));
+  } else if (status === 'requested' || status === 'applying') {
+    parts.push(h('p', { class: 'sg-wait' }, h('span', { class: 'sg-spin' }),
+      status === 'requested' ? '변경안 만드는 중… 보통 2~5분 걸려요. 창을 닫아도 돼요' : '고른 수정을 지침에 반영하는 중…'));
+  } else if (status === 'error') {
+    parts.push(h('p', { class: 'err small' }, p.error || '변경안 작업에 실패했어요'),
+      h('div', { class: 'row-end sg-act' },
+        h('button', { type: 'button', class: 'btn ghost', disabled: sg.saving, onclick: discardProposal }, '닫기'),
+        h('button', { type: 'button', class: 'btn', disabled: sg.saving, onclick: () => sgRun((x) => { x.proposal = null; }, 'site: 변경안 오류 지움').then((ok) => ok && requestProposal()) }, '다시 만들기')));
+  } else if (status === 'ready') {
+    const key = (i) => `${p.created_at}#${i}`;
+    const changes = p.changes || [];
+    const nOn = changes.filter((_, i) => !sg.unchecked.has(key(i))).length;
+    parts.push(h('p', { class: 'small sg-sum' }, h('b', null, p.summary || '변경안'),
+      h('span', { class: 'muted' }, ` · ${fmtTime(p.created_at)}${p.auto ? ' 아침 자동' : ''}`)));
+    if (!changes.length) parts.push(h('p', { class: 'muted small' }, '바꿀 곳이 없다고 봤어요. 아래 이유를 확인해 주세요.'));
+    parts.push(...changes.map((c, i) => {
+      const cb = h('input', { type: 'checkbox', checked: !sg.unchecked.has(key(i)) });
+      cb.addEventListener('change', () => {
+        if (cb.checked) sg.unchecked.delete(key(i));
+        else sg.unchecked.add(key(i));
+        renderSuggest();
+      });
+      const nos = (c.memo_ids || []).map(memoNo).filter(Boolean);
+      return h('div', { class: `sg-change${cb.checked ? '' : ' off'}` },
+        h('label', { class: 'sg-ch-head' }, cb,
+          h('span', null, h('b', null, c.why || '수정'),
+            h('small', { class: 'muted' }, ` ${c.path}${nos.length ? ` · 메모 ${nos.join(', ')}` : ''}`))),
+        c.old ? h('pre', { class: 'sg-del-text' }, c.old) : null,
+        c.new ? h('pre', { class: 'sg-add-text' }, c.new) : h('p', { class: 'muted small' }, '(위 내용을 지움)'));
+    }));
+    if ((p.skipped || []).length) {
+      parts.push(h('div', { class: 'sg-skip' }, h('small', { class: 'muted' }, '반영하지 않은 것'),
+        h('ul', null, p.skipped.map((s) => {
+          const nos = (s.memo_ids || []).map(memoNo).filter(Boolean);
+          return h('li', null, nos.length ? `메모 ${nos.join(', ')}: ` : '', s.reason);
+        }))));
+    }
+    const later = memos.filter((m) => !inProposal.has(m.id)).length;
+    if (later) parts.push(h('p', { class: 'muted small' }, `변경안 뒤에 남긴 메모 ${later}개는 다음 변경안에 들어가요.`));
+    parts.push(h('p', { class: 'muted small' }, '적용하면 이 변경안에 들어간 메모는 비워지고, 아래 「최근 반영」에 남아요.'),
+      h('div', { class: 'row-end sg-act' },
+        h('button', { type: 'button', class: 'btn ghost', disabled: sg.saving, onclick: discardProposal }, '버리기'),
+        changes.length
+          ? h('button', { type: 'button', class: 'btn primary', disabled: sg.saving || !nOn, onclick: applyProposal }, icon('tick'), `고른 ${nOn}개 적용`)
+          : h('button', { type: 'button', class: 'btn primary', disabled: sg.saving, onclick: () => sgRun((x) => {
+            const ids = new Set(p.memo_ids || []);
+            x.memos = (x.memos || []).filter((m) => !ids.has(m.id));
+            x.proposal = null;
+          }, 'site: 반영할 것 없는 메모 비움', '메모를 비웠어요') }, '메모 비우기')));
+  }
+  if (sg.note) parts.push(h('p', { class: 'warn-text small' }, sg.note));
+
+  // 최근 반영
+  const hist = d.history || [];
+  if (hist.length) {
+    parts.push(h('details', { class: 'sg-hist' }, h('summary', null, `최근 반영 ${hist.length}`),
+      h('ul', null, hist.slice(0, 10).map((x) => h('li', null,
+        h('b', null, fmtTime(x.at)), ` ${x.summary || ''}`,
+        (x.applied || []).length ? h('small', { class: 'muted' }, ` · ${x.applied.map((a) => a.why).join(' / ')}`) : null,
+        (x.failed || []).length ? h('small', { class: 'warn-text' }, ` · 적용 실패 ${x.failed.length}`) : null)))));
+  }
+  sg.body.replaceChildren(...parts);
 }
 
 // ---------- 광고 기간 계산 ----------
