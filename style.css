@@ -116,6 +116,7 @@ textarea { resize: vertical; }
 
 /* 사이드바 */
 .side { padding: 18px 14px; border-right: 1px solid var(--line); overflow-y: auto; display: flex; flex-direction: column; }
+.side > * { flex-shrink: 0; }
 .cta {
   display: flex; align-items: center; justify-content: center; gap: 8px;
   height: 42px; margin: 0 4px 10px; border-radius: 12px;
@@ -134,7 +135,7 @@ textarea { resize: vertical; }
 .pf small { grid-column: 2; color: var(--faint); font-size: 11px; }
 .pf .pf-memo { grid-column: 2; grid-row: 1; color: var(--text-2); font-size: 12px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .nav-list { display: flex; flex-direction: column; gap: 2px; }
-.nav { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 12px; border-radius: 10px; color: var(--text-2); font-weight: 500; text-align: left; }
+.nav { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 12px; border-radius: 10px; color: var(--text-2); font-weight: 500; text-align: left; white-space: nowrap; }
 .nav svg.i { color: var(--faint); }
 .nav .vd { margin: 0 5px; }
 .nav:hover { background: var(--soft); }
@@ -142,6 +143,15 @@ textarea { resize: vertical; }
 .nav.on { background: var(--ink-soft); color: var(--text); font-weight: 600; }
 .nav.on svg.i { color: var(--ink); }
 .nav.on .n { background: var(--card); color: var(--text); }
+/* 「분류별 보기」 묶음: 머리를 누르면 아래로 펼쳐진다 */
+.nav-head .chev { margin-left: auto; width: 15px; height: 15px; transition: transform .2s ease; }
+.nav-group.open .nav-head .chev { transform: rotate(180deg); }
+.nav-group.has-on:not(.open) .nav-head { color: var(--text); font-weight: 600; }
+.nav-group-body { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .22s ease; }
+.nav-group.open .nav-group-body { grid-template-rows: 1fr; }
+.nav-group-body > div { overflow: hidden; display: flex; flex-direction: column; gap: 2px; min-height: 0; }
+.nav.sub { padding-left: 26px; }
+@media (prefers-reduced-motion: reduce) { .nav-head .chev, .nav-group-body { transition: none; } }
 .side-notes { margin: 16px 8px 0; font-size: 12px; color: var(--muted); }
 .side-notes summary { cursor: pointer; }
 .side-notes ul { padding-left: 16px; margin: 6px 0; }

@@ -37,6 +37,8 @@ const TOKEN_KEY = 'maildesk.token';
 
 const FILTER_KEY = 'maildesk.filter2';
 
+const GROUP_KEY = 'maildesk.groupOpen';
+
 // 폰에서는 브라우저가 다른 구글 계정이라 Gmail 웹 링크가 안 열린다. 대신 Gmail 앱 작성 화면을 연다.
 const UA = navigator.userAgent || '';
 
@@ -852,17 +854,42 @@ function refreshStale() {
 
 // ---------- 필터 · 목록 ----------
 
+// 사이드바 메뉴. { group }은 눌러서 펼치는 묶음.
 const FILTERS = [
   ['todo', '처리 전', 'inbox'],
-  ['urgent', '급함', 'alarm'],
-  ['green', '초록', null],
-  ['yellow', '노랑', null],
-  ['red', '빨강', null],
-  ['followup', '후속', 'reply'],
-  ['duplicate', '중복', 'dup'],
+  ['drafted', '답장 초안 작성', 'wand'],
+  ['researched', '조사 완료', 'search'],
+  { group: '분류별 보기', icon: 'tag', items: [
+    ['urgent', '급함', 'alarm'],
+    ['green', '초록', null],
+    ['yellow', '노랑', null],
+    ['red', '빨강', null],
+    ['followup', '후속', 'reply'],
+    ['duplicate', '중복', 'dup'],
+  ] },
   ['done', '답장함', 'check'],
   ['all', '전체', 'list'],
 ];
+
+const FLAT_FILTERS = FILTERS.flatMap((x) => (x.group ? x.items : [x]));
+
+const jobBusy = (r) => !!r && !r.error;
+
+// 초안이 있거나 쓰는 중인 메일
+const hasDraft = (m) => (m.drafts || []).length > 0 || jobBusy(m.regenerate_request);
+
+// 「더 조사」를 마쳤거나 조사 중인 메일
+const hasResearch = (m) => !!m.research_note || jobBusy(m.research_request);
+
+// 초안·조사 탭은 받은 순서가 아니라 마지막으로 작업한 순서로 보여준다 (방금 쓴 초안이 맨 위).
+function workedAt(m, f) {
+  const t = (x) => Date.parse(x) || 0;
+  if (f === 'drafted') {
+    return Math.max(t(m.received_at), t(m.regenerate_request?.requested_at),
+      ...(m.drafts || []).map((d) => Math.max(t(d.regenerated_at), t(d.translated_at), t(d.edited_at))));
+  }
+  return Math.max(t(m.received_at), t(m.research_note?.at), t(m.research_request?.requested_at));
+}
 
 // 답장함·전체가 아니면 처리 전 메일만 본다.
 function matchesFilter(m, f) {
@@ -872,6 +899,8 @@ function matchesFilter(m, f) {
   if (done) return false;
   switch (f) {
     case 'todo': return true;
+    case 'drafted': return hasDraft(m);
+    case 'researched': return hasResearch(m);
     case 'urgent': return !!m.urgent;
     case 'green': case 'yellow': case 'red': return m.verdict === f;
     case 'followup': return m.category === 'collab_followup';
@@ -888,11 +917,39 @@ function matchesQuery(m) {
 }
 
 function visibleIds() {
-  return state.order.filter((id) => {
+  const f = state.filter;
+  const ids = state.order.filter((id) => {
     const m = state.mails[id].data;
-    return matchesFilter(m, state.filter) && matchesQuery(m);
+    return matchesFilter(m, f) && matchesQuery(m);
+  });
+  if (f !== 'drafted' && f !== 'researched') return ids;
+  const at = (id) => workedAt(state.mails[id].data, f);
+  return ids.sort((a, b) => at(b) - at(a));
+}
+
+// 초안·조사 작업이 끝나 행이 바뀌면 메뉴 숫자(와 초안·조사 탭 목록)를 한 번에 다시 그린다.
+let navQueued = false;
+function scheduleNav() {
+  if (navQueued) return;
+  navQueued = true;
+  queueMicrotask(() => {
+    navQueued = false;
+    if (!state.ui.rows) return;
+    if (state.filter === 'drafted' || state.filter === 'researched') renderList();
+    else renderNav();
   });
 }
+
+// 작업이 끝났을 때 다른 메일을 보고 있으면 토스트에서 바로 그 메일로 갈 수 있게 한다.
+function goTo(id, f) {
+  if (state.sel === id) return undefined;
+  return { label: '보기', fn: () => { if (!matchesFilter(state.mails[id]?.data || {}, state.filter)) setFilter(f); selectMail(id); } };
+}
+
+const mailName = (id) => {
+  const m = state.mails[id]?.data || {};
+  return m.brand?.name || m.from?.name || '';
+};
 
 function setFilter(f) {
   state.filter = f;
@@ -906,13 +963,32 @@ function renderNav() {
   const all = state.order.map((id) => state.mails[id].data);
   const count = (f) => all.filter((m) => matchesFilter(m, f)).length;
   const lead = (f, ic) => (ic ? icon(ic) : dot(f));
-  nav.replaceChildren(...FILTERS.map(([f, label, ic]) => {
+  const item = ([f, label, ic], sub) => {
     const n = count(f);
-    return h('button', { type: 'button', class: `nav${state.filter === f ? ' on' : ''}`, onclick: () => setFilter(f) },
+    return h('button', { type: 'button', class: `nav${sub ? ' sub' : ''}${state.filter === f ? ' on' : ''}`, onclick: () => setFilter(f) },
       lead(f, ic), label, n || f === 'todo' ? h('span', { class: 'n' }, n) : null);
-  }));
+  };
+  const group = (g) => {
+    const stored = lsGet(GROUP_KEY);
+    const hasOn = g.items.some(([f]) => f === state.filter);
+    // 처음엔 접어 두고, 고른 칸이 묶음 안에 있으면 펼친다. 그 뒤로는 마지막으로 둔 대로.
+    const open = stored == null ? hasOn : stored === '1';
+    const wrap = h('div', { class: `nav-group${open ? ' open' : ''}${hasOn ? ' has-on' : ''}` });
+    const head = h('button', {
+      type: 'button', class: 'nav nav-head', 'aria-expanded': String(open),
+      onclick: () => {
+        const now = !wrap.classList.contains('open');
+        wrap.classList.toggle('open', now);
+        head.setAttribute('aria-expanded', String(now));
+        lsSet(GROUP_KEY, now ? '1' : '0');
+      },
+    }, icon(g.icon), g.group, icon('chev', 'chev'));
+    wrap.append(head, h('div', { class: 'nav-group-body' }, h('div', null, ...g.items.map((x) => item(x, true)))));
+    return wrap;
+  };
+  nav.replaceChildren(...FILTERS.map((x) => (x.group ? group(x) : item(x))));
   // 폰 칩: 0건인 칸은 숨긴다 (처리 전·답장함은 늘 보임)
-  chips.replaceChildren(...FILTERS.filter(([f]) => f === 'todo' || f === 'done' || f === state.filter || count(f))
+  chips.replaceChildren(...FLAT_FILTERS.filter(([f]) => f === 'todo' || f === 'done' || f === state.filter || count(f))
     .map(([f, label, ic]) => {
       const n = count(f);
       return h('button', { type: 'button', class: `chip${state.filter === f ? ' on' : ''}`, onclick: () => setFilter(f) },
@@ -926,7 +1002,9 @@ function renderList() {
   const { rows } = state.ui;
   if (!ids.length) {
     rows.replaceChildren(h('p', { class: 'empty' },
-      state.query ? '검색 결과가 없어요' : state.filter === 'todo' ? '처리할 메일이 없어요' : '메일이 없어요'));
+      state.query ? '검색 결과가 없어요' : state.filter === 'todo' ? '처리할 메일이 없어요'
+        : state.filter === 'drafted' ? '초안을 쓴 메일이 없어요'
+          : state.filter === 'researched' ? '「더 조사」를 한 메일이 없어요' : '메일이 없어요'));
     return;
   }
   rows.replaceChildren(...ids.map((id) => getRow(id)));
@@ -1133,6 +1211,7 @@ function fillHead(id) {
     state.dirty.has(id) ? h('span', { class: 'tag ask' }, '저장 안 됨') : null,
   ].filter(Boolean);
 
+  scheduleNav();
   entry.el.className = rowClass(id);
   entry.el.replaceChildren(
     avatar(title),
@@ -1720,7 +1799,7 @@ async function watchDirection(id) {
       entry.sha = r.fresh.sha;
       if (r.fresh.data.regenerate_request?.error) toast('초안 쓰기에 실패했어요', true);
       else {
-        toast('초안을 썼어요');
+        toast(`${mailName(id) ? `${mailName(id)} ` : ''}초안을 썼어요`, false, goTo(id, 'drafted'));
         rebuildDetail(id);
         rebuilt = true;
       }
@@ -1893,7 +1972,7 @@ function applyRegenerate(id, fresh, kind) {
   entry.rg.input.value = '';
   const comment = fresh.data.drafts?.find((x) => x.kind === kind)?.regen_comment;
   entry.rgNote = { text: `다시 썼어요 ✓${comment ? ` 요청: “${comment}”` : ''}` };
-  toast('초안을 다시 썼어요');
+  toast(`${mailName(id) ? `${mailName(id)} ` : ''}초안을 다시 썼어요`, false, goTo(id, 'drafted'));
 }
 
 async function swapPrevious(id) {
@@ -2083,7 +2162,7 @@ async function watchResearch(id) {
       } else {
         state.db = null;
         await fillResearch(id);
-        toast('조사 결과를 반영했어요');
+        toast(`${mailName(id) ? `${mailName(id)} ` : ''}조사 결과를 반영했어요`, false, goTo(id, 'researched'));
       }
     }
   } finally {
