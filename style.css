@@ -179,6 +179,15 @@ textarea { resize: vertical; }
 .sg-change pre { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; font: 12px/1.6 inherit; font-family: inherit; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow-y: auto; }
 .sg-del-text { background: #FDEEEF; color: #8E2B2F; text-decoration: line-through; text-decoration-color: rgba(142, 43, 47, .35); }
 .sg-add-text { background: #E9F7EF; color: #17603D; }
+.sg-new { display: block; width: 100%; margin-top: 8px; padding: 8px 10px; border: 1px solid transparent; border-radius: 8px; background: #E9F7EF; color: #17603D; font-size: 12px; line-height: 1.6; resize: none; overflow: hidden; }
+.sg-new:hover { border-color: #BFE6CF; }
+.sg-new:focus { background: #fff; color: var(--text); }
+.sg-ch-foot { display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 6px; }
+.sg-ch-foot .tag { margin-right: auto; }
+.sg-ch-foot [hidden] { display: none; }
+.sg-note { display: block; width: 100%; margin-top: 6px; font-size: 12.5px; resize: none; overflow: hidden; }
+.sg-note[hidden] { display: none; }
+.sg-general { margin: 12px 0 4px; }
 .sg-skip { margin-top: 10px; font-size: 12.5px; }
 .sg-skip ul { margin: 4px 0 0; padding-left: 18px; color: var(--text-2); }
 .sg-hist { margin-top: 18px; font-size: 12.5px; }

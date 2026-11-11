@@ -808,7 +808,12 @@ async function applyProposal() {
   const ok = await sgRun((d) => {
     if (d.proposal?.status !== 'ready' || d.proposal.created_at !== p.created_at) { moved = true; return false; }
     d.proposal.status = 'applying';
-    d.proposal.apply = { accepted, requested_at: nowKst() };
+    const edits = sgDraft(p.created_at).edits || {};
+    d.proposal.apply = {
+      accepted,
+      edits: Object.fromEntries(accepted.filter((i) => edits[i] != null).map((i) => [i, edits[i]])),
+      requested_at: nowKst(),
+    };
   }, 'site: 지침 변경안 적용 요청');
   if (moved) return toast('그 사이 변경안이 바뀌었어요. 다시 확인해 주세요', true);
   if (!ok) return;
@@ -816,6 +821,34 @@ async function applyProposal() {
     await dispatch('suggest-apply');
   } catch (e) {
     toast(`적용을 시작하지 못했어요: ${errMsg(e)}`, true);
+  }
+  watchSuggest();
+}
+
+// 수정마다 단 의견·직접 고친 글·체크 상태를 넘겨 변경안을 다시 만든다.
+async function requestRevision() {
+  const sg = state.sg;
+  const p = sg.data?.proposal;
+  if (!p || p.status !== 'ready') return;
+  const draft = sgDraft(p.created_at);
+  if (!sgHasNotes(draft)) return;
+  const changes = (p.changes || []).map((c, i) => ({
+    path: c.path, memo_ids: c.memo_ids, why: c.why, old: c.old, new: c.new,
+    edited: draft.edits[i] ?? null,
+    note: draft.notes[i] || '',
+    checked: !sg.unchecked.has(`${p.created_at}#${i}`),
+  }));
+  let moved = false;
+  const ok = await sgRun((d) => {
+    if (d.proposal?.status !== 'ready' || d.proposal.created_at !== p.created_at) { moved = true; return false; }
+    d.proposal = { status: 'requested', requested_at: nowKst(), revise: { summary: p.summary || '', general: draft.general || '', changes } };
+  }, 'site: 지침 변경안 의견 반영 요청');
+  if (moved) return toast('그 사이 변경안이 바뀌었어요. 다시 확인해 주세요', true);
+  if (!ok) return;
+  try {
+    await dispatch('suggest-propose');
+  } catch (e) {
+    toast(`다시 만들기를 시작하지 못했어요: ${errMsg(e)}`, true);
   }
   watchSuggest();
 }
@@ -945,7 +978,9 @@ function renderSuggest() {
       h('button', { type: 'button', class: 'btn', disabled: sg.saving || !memos.length, onclick: requestProposal }, icon('wand'), '지금 변경안 만들기')));
   } else if (status === 'requested' || status === 'applying') {
     parts.push(h('p', { class: 'sg-wait' }, h('span', { class: 'sg-spin' }),
-      status === 'requested' ? '변경안 만드는 중… 보통 2~5분 걸려요. 창을 닫아도 돼요' : '고른 수정을 지침에 반영하는 중…'));
+      status === 'applying' ? '고른 수정을 지침에 반영하는 중…'
+        : p.revise ? '의견 반영해 다시 만드는 중… 보통 2~5분 걸려요. 창을 닫아도 돼요'
+          : '변경안 만드는 중… 보통 2~5분 걸려요. 창을 닫아도 돼요'));
   } else if (status === 'error') {
     parts.push(h('p', { class: 'err small' }, p.error || '변경안 작업에 실패했어요'),
       h('div', { class: 'row-end sg-act' },
@@ -953,11 +988,13 @@ function renderSuggest() {
         h('button', { type: 'button', class: 'btn', disabled: sg.saving, onclick: () => sgRun((x) => { x.proposal = null; }, 'site: 변경안 오류 지움').then((ok) => ok && requestProposal()) }, '다시 만들기')));
   } else if (status === 'ready') {
     const key = (i) => `${p.created_at}#${i}`;
+    const draft = sgDraft(p.created_at);
     const changes = p.changes || [];
     const nOn = changes.filter((_, i) => !sg.unchecked.has(key(i))).length;
     parts.push(h('p', { class: 'small sg-sum' }, h('b', null, p.summary || '변경안'),
       h('span', { class: 'muted' }, ` · ${fmtTime(p.created_at)}${p.auto ? ' 아침 자동' : ''}`)));
     if (!changes.length) parts.push(h('p', { class: 'muted small' }, '바꿀 곳이 없다고 봤어요. 아래 이유를 확인해 주세요.'));
+    else parts.push(h('p', { class: 'muted small' }, '초록 칸은 바로 고칠 수 있어요. 고친 글 그대로 적용돼요. 다시 써 달라고 하려면 「의견 달기」를 눌러 주세요.'));
     parts.push(...changes.map((c, i) => {
       const cb = h('input', { type: 'checkbox', checked: !sg.unchecked.has(key(i)) });
       cb.addEventListener('change', () => {
@@ -966,12 +1003,59 @@ function renderSuggest() {
         renderSuggest();
       });
       const nos = (c.memo_ids || []).map(memoNo).filter(Boolean);
+
+      // 새 글: 바로 고칠 수 있다
+      const ta = h('textarea', { class: 'sg-new', rows: '1', 'aria-label': '바꿀 글', placeholder: '(비우면 위 내용을 지워요)' });
+      ta.value = draft.edits[i] ?? c.new ?? '';
+      const editedTag = h('span', { class: 'tag sg-edited' }, '직접 고침');
+      const undo = h('button', { type: 'button', class: 'btn ghost sm' }, '제안대로 되돌리기');
+      const mark = () => {
+        const ed = draft.edits[i] != null;
+        editedTag.hidden = !ed;
+        undo.hidden = !ed;
+      };
+      ta.addEventListener('input', () => {
+        if (ta.value === (c.new ?? '')) delete draft.edits[i];
+        else draft.edits[i] = ta.value;
+        saveSgDraft();
+        autosize(ta);
+        mark();
+      });
+      undo.addEventListener('click', () => {
+        delete draft.edits[i];
+        ta.value = c.new ?? '';
+        saveSgDraft();
+        autosize(ta);
+        mark();
+      });
+      mark();
+
+      // 수정 의견
+      const note = h('textarea', { class: 'input sg-note', rows: '1', placeholder: '이 수정에 대한 의견 (예: 더 짧게, 답장-스타일.md에도 넣어줘)' });
+      note.value = draft.notes[i] || '';
+      note.hidden = !note.value;
+      note.addEventListener('input', () => {
+        if (note.value.trim()) draft.notes[i] = note.value;
+        else delete draft.notes[i];
+        saveSgDraft();
+        autosize(note);
+        syncSgButtons();
+      });
+      const noteBtn = h('button', { type: 'button', class: 'btn ghost sm', hidden: !note.hidden }, icon('pen'), '의견 달기');
+      noteBtn.addEventListener('click', () => {
+        note.hidden = false;
+        noteBtn.hidden = true;
+        note.focus();
+      });
+
       return h('div', { class: `sg-change${cb.checked ? '' : ' off'}` },
         h('label', { class: 'sg-ch-head' }, cb,
           h('span', null, h('b', null, c.why || '수정'),
             h('small', { class: 'muted' }, ` ${c.path}${nos.length ? ` · 메모 ${nos.join(', ')}` : ''}`))),
         c.old ? h('pre', { class: 'sg-del-text' }, c.old) : null,
-        c.new ? h('pre', { class: 'sg-add-text' }, c.new) : h('p', { class: 'muted small' }, '(위 내용을 지움)'));
+        ta,
+        h('div', { class: 'sg-ch-foot' }, editedTag, undo, noteBtn),
+        note);
     }));
     if ((p.skipped || []).length) {
       parts.push(h('div', { class: 'sg-skip' }, h('small', { class: 'muted' }, '반영하지 않은 것'),
@@ -980,11 +1064,23 @@ function renderSuggest() {
           return h('li', null, nos.length ? `메모 ${nos.join(', ')}: ` : '', s.reason);
         }))));
     }
+    const general = h('textarea', { class: 'input sg-note sg-general', rows: '1', placeholder: '변경안 전체에 대한 의견 (선택. 예: 메모 2도 반영해줘)' });
+    general.value = draft.general || '';
+    general.addEventListener('input', () => {
+      draft.general = general.value;
+      saveSgDraft();
+      autosize(general);
+      syncSgButtons();
+    });
+    parts.push(general);
     const later = memos.filter((m) => !inProposal.has(m.id)).length;
-    if (later) parts.push(h('p', { class: 'muted small' }, `변경안 뒤에 남긴 메모 ${later}개는 다음 변경안에 들어가요.`));
-    parts.push(h('p', { class: 'muted small' }, '적용하면 이 변경안에 들어간 메모는 비워지고, 아래 「최근 반영」에 남아요.'),
+    if (later) parts.push(h('p', { class: 'muted small' }, `변경안 뒤에 남긴 메모 ${later}개는 다음 변경안(다시 만들기 포함)에 들어가요.`));
+    sg.hint = h('p', { class: 'muted small' });
+    sg.reviseBtn = h('button', { type: 'button', class: 'btn', disabled: true, onclick: requestRevision }, icon('wand'), '의견 반영해 다시 만들기');
+    parts.push(sg.hint,
       h('div', { class: 'row-end sg-act' },
         h('button', { type: 'button', class: 'btn ghost', disabled: sg.saving, onclick: discardProposal }, '버리기'),
+        sg.reviseBtn,
         changes.length
           ? h('button', { type: 'button', class: 'btn primary', disabled: sg.saving || !nOn, onclick: applyProposal }, icon('tick'), `고른 ${nOn}개 적용`)
           : h('button', { type: 'button', class: 'btn primary', disabled: sg.saving, onclick: () => sgRun((x) => {
@@ -1005,6 +1101,42 @@ function renderSuggest() {
         (x.failed || []).length ? h('small', { class: 'warn-text' }, ` · 적용 실패 ${x.failed.length}`) : null)))));
   }
   sg.body.replaceChildren(...parts);
+  requestAnimationFrame(() => sg.body.querySelectorAll('textarea').forEach((t) => { if (!t.hidden) autosize(t); }));
+  syncSgButtons();
+}
+
+// 의견·직접 고친 내용은 이 브라우저에 잠깐 보관한다 (창을 닫거나 새로고침해도 남게). 변경안이 바뀌면 새로 시작.
+const SG_DRAFT_KEY = 'maildesk.sgDraft';
+
+function sgDraft(createdAt) {
+  const sg = state.sg;
+  if (sg.draft?.created_at !== createdAt) {
+    let saved = null;
+    try { saved = JSON.parse(lsGet(SG_DRAFT_KEY) || 'null'); } catch { /* 깨진 값 */ }
+    sg.draft = saved?.created_at === createdAt
+      ? { edits: {}, notes: {}, general: '', ...saved }
+      : { created_at: createdAt, edits: {}, notes: {}, general: '' };
+  }
+  return sg.draft;
+}
+
+function saveSgDraft() {
+  if (state.sg.draft) lsSet(SG_DRAFT_KEY, JSON.stringify(state.sg.draft));
+}
+
+const sgHasNotes = (dr) => !!dr && (Object.values(dr.notes || {}).some((x) => x.trim()) || !!dr.general?.trim());
+
+function syncSgButtons() {
+  const sg = state.sg;
+  const p = sg.data?.proposal;
+  if (!sg.reviseBtn || p?.status !== 'ready') return;
+  const notes = sgHasNotes(sg.draft);
+  const edited = Object.keys(sg.draft?.edits || {}).length;
+  sg.reviseBtn.disabled = sg.saving || !notes;
+  sg.reviseBtn.title = notes ? '' : '의견을 하나 이상 적으면 눌러져요';
+  sg.hint.textContent = notes
+    ? '의견이 있어요. 「다시 만들기」를 누르면 의견 단 수정만 다시 쓰고 나머지는 그대로 둬요. 바로 적용하면 의견은 반영되지 않아요.'
+    : edited ? `직접 고친 수정 ${edited}개는 고친 글 그대로 적용돼요.` : '';
 }
 
 // ---------- 광고 기간 계산 ----------
